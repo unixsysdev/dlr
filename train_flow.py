@@ -23,11 +23,12 @@ import os
 import json
 import time
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from config import DLRConfig
-from modules.flow_expert import FlowExpert, masked_mse_loss
+from modules.flow_expert import FlowExpert, masked_mse_loss, stop_indices_from_active_mask
 from modules.energy_critic import EnergyCritic, energy_contrastive_loss, flow_energy_penalty
 from modules.text_jepa import TextJEPA
 from data_pipeline import TrajectoryDataset
@@ -132,12 +133,14 @@ def train_flow(config: DLRConfig, jepa_model: TextJEPA = None) -> dict:
     print(f"\n[4/4] Training for {config.flow_epochs} epochs...")
     print(f"  Energy penalty weight α = {config.energy_penalty_weight}")
     print(f"  Noise std for negatives: {config.energy_noise_std}")
+    print(f"  Stop loss weight = {config.stop_loss_weight}")
     print(f"  Oracle exposure rate = {config.oracle_exposure_rate:.0%}")
 
     history = {
         "loss": [], "epoch_loss": [],
         "flow_loss": [], "energy_penalty": [],
         "critic_loss": [],
+        "stop_loss": [], "stop_acc": [],
         "oracle_exposure": [],
     }
     t_start = time.time()
@@ -162,6 +165,7 @@ def train_flow(config: DLRConfig, jepa_model: TextJEPA = None) -> dict:
             z_0 = Z_true[:, 0, :]                           # [B, d]
 
             B = Z_true.shape[0]
+            stop_targets = stop_indices_from_active_mask(active_mask)
 
             # Scheduled Oracle replacement:
             # expose the flow model to predicted goals so evaluation-time
@@ -207,16 +211,25 @@ def train_flow(config: DLRConfig, jepa_model: TextJEPA = None) -> dict:
             # Forward (BF16 autocast)
             with config.autocast_ctx:
                 v_pred = flow_model(x_t, t, z_0, z_cond)  # [B, N, d]
+                stop_logits = raw_flow.predict_stop(z_0, z_cond)
 
                 # Masked MSE loss (Velocity Zero-Out)
                 flow_mse = masked_mse_loss(v_pred, v_true, active_mask)
+                stop_loss = F.cross_entropy(stop_logits, stop_targets)
+                stop_acc = (
+                    stop_logits.argmax(dim=-1) == stop_targets
+                ).float().mean()
 
                 # Energy penalty: penalize high-energy predicted endpoints
                 e_penalty = flow_energy_penalty(
                     raw_critic, x_t, v_pred, t
                 )
 
-                loss = flow_mse + config.energy_penalty_weight * e_penalty
+                loss = (
+                    flow_mse
+                    + config.energy_penalty_weight * e_penalty
+                    + config.stop_loss_weight * stop_loss
+                )
 
             # Backward
             flow_optimizer.zero_grad()
@@ -229,12 +242,15 @@ def train_flow(config: DLRConfig, jepa_model: TextJEPA = None) -> dict:
             history["flow_loss"].append(flow_mse.item())
             history["energy_penalty"].append(e_penalty.item())
             history["critic_loss"].append(critic_loss.item())
+            history["stop_loss"].append(stop_loss.item())
+            history["stop_acc"].append(stop_acc.item())
             history["oracle_exposure"].append(use_oracle.float().mean().item())
             epoch_loss += loss.item()
             n_batches += 1
 
             pbar.set_postfix(
                 flow=f"{flow_mse.item():.4f}",
+                stop=f"{stop_acc.item():.2f}",
                 e_pen=f"{e_penalty.item():.3f}",
                 crit=f"{critic_loss.item():.3f}",
                 ora=f"{use_oracle.float().mean().item():.2f}",

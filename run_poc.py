@@ -177,7 +177,15 @@ def main():
                 n_layers=config.flow_layers,
                 n_waypoints=config.n_waypoints,
             ).to(config.device)
-            flow_model.load_state_dict(ckpt["model_state_dict"])
+            incompatible = flow_model.load_state_dict(
+                ckpt["model_state_dict"], strict=False
+            )
+            if incompatible.missing_keys or incompatible.unexpected_keys:
+                print(
+                    "⚠ Flow checkpoint is not fully compatible with the current "
+                    f"architecture: missing={incompatible.missing_keys}, "
+                    f"unexpected={incompatible.unexpected_keys}"
+                )
 
     if decoder_model is None:
         dec_ckpt = os.path.join(config.checkpoint_dir, "decoder_final.pt")

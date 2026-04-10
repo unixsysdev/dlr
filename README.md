@@ -10,8 +10,8 @@ We present the **Decoupled Latent Reasoner** (DLR), a three-module architecture 
 
 The architecture consists of:
 
-1. A **Text-JEPA** (Joint Embedding Predictive Architecture) regularized via **VICReg** that learns the latent geometry of logical transitions, paired with an **Oracle Predictor** that hypothesizes the final proof state directly from the premise.
-2. A **Rectified Flow Expert** (DiT backbone) guided by an **Energy Critic** that generates optimal-transport trajectories between the premise and the predicted conclusion through deterministic ODE integration.
+1. A **Text-JEPA** (Joint Embedding Predictive Architecture) regularized via **VICReg** that learns the latent geometry of logical transitions, paired with an **Oracle Predictor** that hypothesizes the final cumulative goal state directly from the premise.
+2. A **Rectified Flow Expert** (DiT backbone) guided by an **Energy Critic** that generates optimal-transport trajectories between the premise and the predicted goal state through deterministic ODE integration.
 3. A **Scribe Decoder** that translates the continuous trajectory into discrete mathematical text via sliding-window cross-attention.
 
 This repository provides a complete, GPU-validated Proof-of-Concept implementation, including a custom math-native tokenizer, configurable compute optimizations (torch.compile, BF16, Liger kernels), and a strict end-to-end evaluation dashboard. The architecture is designed for validation on a single high-memory GPU (H200/B200) within 24 hours.
@@ -27,7 +27,7 @@ Consider how a human mathematician works. They first grasp the problem structure
 DLR replicates this workflow:
 
 - The **Text-JEPA** learns to represent reasoning states as points in a continuous $d$-dimensional manifold, capturing the logical "momentum" of a proof.
-- The **Flow Expert** acts as a logic physics engine, computing the shortest geometrically valid path between the premise and the conclusion using Rectified Flow.
+- The **Flow Expert** acts as a latent planner, learning a conditioned transport path between the premise and the predicted goal state using Rectified Flow.
 - The **Decoder** reads this pre-computed trajectory and transcribes it into text.
 
 The critical insight is that **reasoning happens in continuous space, not in token space**. Token generation is a post-hoc decoding step, not a cognitive one.
@@ -40,7 +40,7 @@ The critical insight is that **reasoning happens in continuous space, not in tok
 
 A 1D-sequence adaptation of I-JEPA for structured mathematical reasoning, heavily modified to prevent dimensional collapse and eliminate target leakage.
 
-**The Oracle Predictor**: To prevent the model from "cheating" by peeking at the ground-truth conclusion, an Oracle network predicts the final proof state ($\hat{z}_{final}$) strictly from the premise ($z_0$).
+**The Oracle Predictor**: To prevent the model from "cheating" by peeking at the extracted flow endpoint, an Oracle network predicts the final cumulative goal state ($\hat{z}_{final}$) strictly from the premise ($z_0$).
 
 $$\mathcal{L}_{Oracle} = \| \hat{z}_{final} - \text{sg}(z_{final}) \|^2_2$$
 
@@ -52,7 +52,7 @@ $$\mathcal{L}_{JEPA} = \lambda \mathcal{L}_{inv} + \mu \mathcal{L}_{var} + \nu \
 |---|---|---|
 | Context Encoder $E_x$ | Encodes premise + previous steps | ✓ Trainable |
 | Target Encoder $E_y$ | Encodes the ground-truth next step (via EMA) | ✗ Frozen (EMA) |
-| Oracle Predictor $P_{macro}$ | Deep MLP predicting $\hat{z}_{final}$ from $z_0$ | ✓ Trainable |
+| Oracle Predictor $P_{macro}$ | Deep MLP predicting the final cumulative goal state $\hat{z}_{final}$ from $z_0$ | ✓ Trainable |
 | Step Predictor $P_{micro}$ | Narrow MLP with learned "next-step" embedding | ✓ Trainable |
 
 ### Module B: Rectified Flow Expert (Logic Engine)
@@ -68,7 +68,7 @@ $$v_{true} = Z_{true} - \epsilon$$
 
 $$\mathcal{L}_{flow} = \mathbb{E}_{t, \varepsilon} \left[ \| v_\theta(x_t, t, z_0, \hat{z}_{final}) - v_{true} \|^2 \cdot \mathbf{m} + \alpha \mathcal{E}(x_t) \right]$$
 
-**Unified Trajectory Architecture:** The Flow Expert receives the premise and predicted goal via Adaptive Layer Normalization (AdaLN).
+**Unified Trajectory Architecture:** The Flow Expert receives the premise and predicted goal via Adaptive Layer Normalization (AdaLN), predicts the final active waypoint, and enforces both start and end boundary conditions during generation.
 
 $$\text{cond} = \text{MLP}([z_0 \mid \hat{z}_{final} \mid \phi(t)])$$
 
@@ -86,7 +86,7 @@ A lightweight causal decoder that translates the $N \times d$ continuous traject
 
 ## Key Design Decisions
 
-**Autonomous Goal Formulation:** By forcing the system to predict its own endpoint ($\hat{z}_{final}$) before reasoning begins — trained against the actual *conclusion* of each proof, not an intermediate step — we align the architecture with genuine problem-solving rather than supervised interpolation.
+**Autonomous Goal Formulation:** The Oracle is trained against the same full cumulative endpoint used by trajectory extraction, so Module A and Module B agree on what a “goal state” is.
 
 **VICReg Anti-Collapse:** Replacing simple L2 variance monitors with explicit Variance and Covariance penalties ensures that the "Geometry of Not Being Wrong" maintains a rigid, high-fidelity topology where distance equates to logical divergence.
 
@@ -98,11 +98,13 @@ A lightweight causal decoder that translates the $N \times d$ continuous traject
 
 **Oracle Exposure During Flow Training:** The Flow Expert no longer trains only against perfect endpoints. A configurable fraction of batches swaps the ground-truth target for the Oracle's predicted goal, reducing the train/eval mismatch when the Oracle is imperfect.
 
+**Stop-Aware Trajectories:** The Flow Expert predicts the final active waypoint index and clamps the inactive tail to the goal state. The decoder cross-attends only to active waypoints, which removes the previous train/eval mismatch around padded tails.
+
 **Unified Trajectory Cache (No Double-Dip):** The JEPA's cumulative encoding compresses the full problem context into $z_0 = E_y(\text{[PREMISE]})$. The Flow Expert receives $z_0$ via AdaLN, eliminating the need for a massive token-level KV cache. Memory reduction: from $[S \times d] + [N \times d]$ to $[N \times d]$ only.
 
 **Custom Math-Native Tokenizer:** A BPE tokenizer trained directly on the mathematical reasoning corpus. Numbers remain intact as single tokens (e.g., `256`), and structural tokens (`[PREMISE]`, `[STEP]`) are native entries.
 
-**Train/Test Hygiene:** Explicit 90/10 data split. Metric D remains a train-split diagnostic on extracted `Z_true`, while Metric E encodes held-out test premises on the fly and never loads `trajectories.pt`. No training trajectories contaminate the honest dashboard.
+**Train/Test Hygiene:** Explicit 90/10 data split. Metric D remains a train-split diagnostic on extracted `Z_true`, while Metric E encodes held-out test premises on the fly and never loads `trajectories.pt`. Phase 3 now trains the decoder on a scheduled mix of extracted and generated trajectories instead of clean `Z_true` alone.
 
 ---
 
@@ -113,10 +115,10 @@ Five strict metrics designed to isolate each stage of the information pipeline. 
 | Metric | What It Measures | Success Criterion |
 |---|---|---|
 | **A. VICReg Stability** | Variance and Covariance losses over training | Rapid stabilization without dimensional collapse |
-| **B. Oracle Accuracy** | $\| \hat{z}_{final} - z_{conclusion} \|$ (true conclusion, not step k+1) | Oracle maps premise to valid proof sink |
+| **B. Oracle Accuracy** | $\| \hat{z}_{final} - z_{goal} \|$ (full cumulative endpoint) | Oracle maps premise to the same latent sink used by the flow model |
 | **C. Flow Trajectory Validity** | $\mathcal{E}(Z_{generated})$ + hard boundary check | Generated trajectories start at $z_0$ and maintain low energy |
 | **D. Token Recovery (diagnostic)** | Exact match of numbers/operators decoded from extracted `Z_true` | Decoder can read latent trajectories at all |
-| **E. Honest Full Pipeline** | Held-out premise → JEPA → Oracle → Flow → Decoder, plus final-answer exact match | Non-zero held-out recovery without trajectory leakage |
+| **E. Honest Full Pipeline** | Held-out premise → JEPA → Oracle → Flow → Decoder, plus final-answer exact match and symbolic equivalence when parseable | Non-zero held-out recovery without trajectory leakage |
 
 ---
 

@@ -38,6 +38,7 @@ tail -f dlr_run.log
 | Pooling | Attention-weighted (learned query) |
 | Batch sizes | 256/128/128 |
 | Oracle exposure | 20% target replacement during flow training |
+| Decoder training | Mixed extracted/generated trajectory curriculum |
 | ODE solver | Heun (2nd order) + hard boundary |
 | VICReg | λ_inv=25, λ_var=25, λ_cov=1 |
 | Eval decoding | Greedy (`temperature=0.0`) |
@@ -68,8 +69,8 @@ grep "PHASE\|Epoch\|✓\|⚠" dlr_run.log | tail -20
 # Phase 1: VICReg sub-losses (inv should decrease, var should stabilize near 0)
 grep "inv=\|var=\|ora=" dlr_run.log | tail -10
 
-# Phase 2: Flow + Energy penalty
-grep "flow=\|e_pen=\|crit=" dlr_run.log | tail -10
+# Phase 2: Flow + stop + Energy penalty
+grep "flow=\|stop=\|e_pen=\|crit=" dlr_run.log | tail -10
 
 # Check z_var (VICReg should keep this healthy automatically)
 grep "z_v=" dlr_run.log | tail -5
@@ -83,7 +84,8 @@ grep "Flow.*Loss\|Epoch.*Loss" dlr_run.log | tail -10
 | Signal | Meaning | Action |
 |---|---|---|
 | `var_loss > 1.0` sustained | VICReg variance not kicking in | Increase `vicreg_lambda_var` |
-| `oracle_loss` not decreasing | Oracle can't predict conclusions | Increase `oracle_layers` (try 6→8) |
+| `oracle_loss` not decreasing | Oracle can't predict final goal states | Increase `oracle_layers` (try 6→8) |
+| `stop` stays near chance | Flow stop head is not learning endpoint length | Increase `stop_loss_weight` or inspect masks |
 | `e_pen` near 0 from start | Energy Critic too weak | Increase `energy_noise_std` |
 | `crit_loss` near 0 | Critic perfectly separates (good) | Normal — means negatives are easy |
 | `flow_loss` stalls > 1.0 | Flow can't learn velocity | Check trajectory quality, try more JEPA epochs |
@@ -122,7 +124,7 @@ data/
   jepa_history.json       # Phase 1 metrics (VICReg + Oracle losses)
   flow_history.json       # Phase 2 metrics (flow + energy + critic)
   decoder_history.json    # Phase 3 metrics
-  full_pipeline_results.json  # Metric E honest eval results + final-answer EM
+  full_pipeline_results.json  # Metric E honest eval results + answer EM/symbolic match
 
 plots/
   01_jepa_training.png              # VICReg sub-losses + z_var + EMA schedule
@@ -143,8 +145,8 @@ The primary pass/fail is `08_full_pipeline_recovery.png`. This runs **on held-ou
 premise → JEPA.encode (attn-pool) → z_0
 z_0 → Oracle.predict_goal → ĉ_final
 noise → Flow.generate(z_0, ĉ_final, heun, hard_boundary) → Z_gen
-Z_gen → Decoder.generate → text
+Z_gen + active_mask → Decoder.generate → text
 text vs. ground_truth → recovery rate
 ```
 
-**No ground-truth leakage at any stage. No training trajectory contamination.** Metric E now encodes each held-out premise directly through the JEPA instead of loading `trajectories.pt`, and reports both token recovery and final-answer exact match.
+**No ground-truth leakage at any stage. No training trajectory contamination.** Metric E now encodes each held-out premise directly through the JEPA instead of loading `trajectories.pt`, and reports token recovery, final-answer exact match, and symbolic equivalence when parseable.

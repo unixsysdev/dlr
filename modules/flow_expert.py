@@ -135,6 +135,13 @@ class FlowExpert(nn.Module):
             [DiTBlock(d_model, n_heads, ff_mult, dropout) for _ in range(n_layers)]
         )
 
+        # Predict which waypoint is the final active state.
+        self.stop_head = nn.Sequential(
+            nn.Linear(d_model * 2, d_model),
+            nn.SiLU(),
+            nn.Linear(d_model, n_waypoints),
+        )
+
         # Output
         self.final_norm = nn.LayerNorm(d_model)
         self.out_proj = nn.Linear(d_model, d_model)
@@ -151,6 +158,37 @@ class FlowExpert(nn.Module):
         )
         args = t.unsqueeze(-1) * freqs.unsqueeze(0)  # [B, d//2]
         return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)  # [B, d]
+
+    def predict_stop(self, z_0: torch.Tensor, z_target: torch.Tensor) -> torch.Tensor:
+        """Predict the final active waypoint index from boundary conditions."""
+        return self.stop_head(torch.cat([z_0, z_target], dim=-1))
+
+    def _apply_boundary_conditions(
+        self,
+        x: torch.Tensor,
+        z_0: torch.Tensor,
+        z_target: torch.Tensor,
+        stop_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Enforce start and end boundary conditions.
+
+        Waypoints after the predicted final active index are clamped to z_target
+        so the decoder sees a stable inactive tail rather than arbitrary drift.
+        """
+        B, N, _ = x.shape
+        stop_idx = stop_idx.clamp(min=1, max=N - 1)
+        x[:, 0, :] = z_0
+
+        batch_idx = torch.arange(B, device=x.device)
+        x[batch_idx, stop_idx, :] = z_target
+
+        tail_mask = (
+            torch.arange(N, device=x.device).unsqueeze(0) > stop_idx.unsqueeze(1)
+        )
+        x = torch.where(tail_mask.unsqueeze(-1), z_target.unsqueeze(1), x)
+        x[:, 0, :] = z_0
+        return x
 
     def forward(
         self,
@@ -195,6 +233,8 @@ class FlowExpert(nn.Module):
         z_target: torch.Tensor,
         n_steps: int = 50,
         solver: str = "euler",
+        stop_idx: torch.Tensor = None,
+        return_mask: bool = False,
     ) -> torch.Tensor:
         """
         Generate a trajectory from noise using ODE integration.
@@ -211,15 +251,20 @@ class FlowExpert(nn.Module):
 
         Returns:
             trajectory: [B, N, d] generated trajectory
+            active_mask: [B, N] if return_mask=True
         """
         B = z_target.shape[0]
         device = z_target.device
 
+        if stop_idx is None:
+            stop_logits = self.predict_stop(z_0, z_target)
+            stop_idx = stop_logits.argmax(dim=-1)
+        stop_idx = stop_idx.clamp(min=1, max=self.n_waypoints - 1)
+        active_mask = active_mask_from_stop_indices(stop_idx, self.n_waypoints)
+
         # Start from Gaussian noise
         x = torch.randn(B, self.n_waypoints, self.d_model, device=device)
-
-        # Hard boundary: clamp waypoint 0 to premise from the start
-        x[:, 0, :] = z_0
+        x = self._apply_boundary_conditions(x, z_0, z_target, stop_idx)
 
         dt = 1.0 / n_steps
         for i in range(n_steps):
@@ -240,9 +285,10 @@ class FlowExpert(nn.Module):
                 # Standard Euler step
                 x = x + v * dt
 
-            # Hard boundary: trajectory MUST start at premise
-            x[:, 0, :] = z_0
+            x = self._apply_boundary_conditions(x, z_0, z_target, stop_idx)
 
+        if return_mask:
+            return x, active_mask
         return x
 
 
@@ -268,3 +314,17 @@ def masked_mse_loss(
     diff = diff.mean(dim=-1)     # [B, N] — per-waypoint MSE
     diff = diff * mask           # Zero out padded waypoints
     return diff.sum() / mask.sum().clamp(min=1)
+
+
+def stop_indices_from_active_mask(mask: torch.Tensor) -> torch.Tensor:
+    """Convert an active waypoint mask [B, N] into final active indices [B]."""
+    return mask.sum(dim=1).long().clamp(min=1) - 1
+
+
+def active_mask_from_stop_indices(
+    stop_idx: torch.Tensor,
+    n_waypoints: int,
+) -> torch.Tensor:
+    """Convert final active indices [B] into float masks [B, N]."""
+    positions = torch.arange(n_waypoints, device=stop_idx.device).unsqueeze(0)
+    return (positions <= stop_idx.unsqueeze(1)).float()

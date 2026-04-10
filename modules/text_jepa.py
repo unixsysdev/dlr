@@ -242,8 +242,8 @@ class TextJEPA(nn.Module):
         target_mask: torch.Tensor,
         premise_ids: torch.Tensor = None,
         premise_mask: torch.Tensor = None,
-        conclusion_ids: torch.Tensor = None,
-        conclusion_mask: torch.Tensor = None,
+        goal_ids: torch.Tensor = None,
+        goal_mask: torch.Tensor = None,
     ):
         """
         Forward pass for JEPA + Oracle training.
@@ -255,13 +255,13 @@ class TextJEPA(nn.Module):
             target_mask: [B, S]
             premise_ids: [B, S] premise only — Oracle INPUT
             premise_mask: [B, S]
-            conclusion_ids: [B, S] final step only — Oracle TARGET
-            conclusion_mask: [B, S]
+            goal_ids: [B, S] full cumulative goal state — Oracle TARGET
+            goal_mask: [B, S]
 
         Returns:
             dict with:
                 jepa_loss: L2 prediction loss (micro-predictor)
-                oracle_loss: Oracle MSE loss against true conclusion
+                oracle_loss: Oracle MSE loss against true goal state
                 z_var: variance of z_target (collapse detector)
                 z_target: [B, d] target representations (detached)
         """
@@ -283,23 +283,22 @@ class TextJEPA(nn.Module):
         # Collapse detection: per-dim variance averaged across batch
         z_var = z_target.var(dim=0).mean().item()
 
-        # Oracle loss: predict CONCLUSION from PREMISE
+        # Oracle loss: predict the final cumulative goal state from the premise
         oracle_loss = torch.tensor(0.0, device=context_ids.device)
-        if premise_ids is not None and conclusion_ids is not None:
+        if premise_ids is not None and goal_ids is not None:
             # Encode premise through EMA target encoder
             with torch.no_grad():
                 prem_seq = self.target_encoder(premise_ids, premise_mask)
                 z_0 = self.target_encoder.pool(prem_seq, premise_mask)  # [B, d]
 
-                # Encode the ACTUAL conclusion (final step, NOT step k+1)
-                concl_seq = self.target_encoder(conclusion_ids, conclusion_mask)
-                z_final = self.target_encoder.pool(concl_seq, conclusion_mask)  # [B, d]
+                # Encode the ACTUAL goal state that matches the extracted flow endpoint
+                goal_seq = self.target_encoder(goal_ids, goal_mask)
+                z_goal = self.target_encoder.pool(goal_seq, goal_mask)  # [B, d]
 
-            # Oracle predicts z_final from z_0 (premise only)
-            z_hat_final = self.oracle(z_0)  # [B, d]
+            # Oracle predicts the same endpoint object the flow model uses
+            z_hat_goal = self.oracle(z_0)  # [B, d]
 
-            # MSE against the TRUE conclusion, not step k+1
-            oracle_loss = torch.nn.functional.mse_loss(z_hat_final, z_final.detach())
+            oracle_loss = torch.nn.functional.mse_loss(z_hat_goal, z_goal.detach())
 
         return {
             "jepa_loss": jepa_loss,

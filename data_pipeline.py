@@ -105,9 +105,14 @@ def format_target(step: str) -> str:
     return f"[STEP] {step} [/STEP]"
 
 
-def format_conclusion(steps: List[str]) -> str:
-    """Format the FINAL step only — the conclusion. Used as Oracle's true target."""
-    return f"[STEP] {steps[-1]} [/STEP] [CONCLUSION]"
+def format_goal_state(problem: str, steps: List[str]) -> str:
+    """
+    Format the full cumulative proof state at the final prefix.
+
+    This is the object the Flow Expert uses as z_target after trajectory
+    extraction, so the Oracle must be trained against the same endpoint.
+    """
+    return format_context(problem, steps, len(steps) - 1)
 
 
 def format_full_solution(steps: List[str]) -> str:
@@ -176,10 +181,10 @@ class JEPADataset(Dataset):
     Dataset for Phase 1: JEPA + Oracle training.
 
     Yields 5-tuples using a sliding window:
-      Context    = [PREMISE] problem [/PREMISE] [STEP] s1 ... [STEP] si
-      Target     = [STEP] s_{i+1} [/STEP]          (micro-predictor target)
-      Premise    = [PREMISE] problem [/PREMISE]     (Oracle input — premise ONLY)
-      Conclusion = [STEP] s_final [/STEP] [CONCLUSION]  (Oracle target — final step)
+      Context   = [PREMISE] problem [/PREMISE] [STEP] s1 ... [STEP] si
+      Target    = [STEP] s_{i+1} [/STEP]              (micro-predictor target)
+      Premise   = [PREMISE] problem [/PREMISE]        (Oracle input — premise ONLY)
+      GoalState = full cumulative proof prefix        (Oracle target / Flow endpoint)
     """
 
     def __init__(
@@ -197,9 +202,9 @@ class JEPADataset(Dataset):
             problem = item["problem"]
             steps = item["steps"]
             premise = format_premise(problem)
-            conclusion = format_conclusion(steps)
+            goal_state = format_goal_state(problem, steps)
 
-            # Sliding window: each pair is (prefix, next_step, premise, conclusion)
+            # Sliding window: each pair is (prefix, next_step, premise, goal_state)
             for i in range(len(steps) - 1):
                 context = format_context(problem, steps, i)
                 target = format_target(steps[i + 1])
@@ -208,11 +213,12 @@ class JEPADataset(Dataset):
                 # Truncation silently chops the premise or recent steps,
                 # causing the JEPA to learn corrupted representations.
                 ctx_len = len(tokenizer.encode(context))
-                if ctx_len > max_seq_len:
+                goal_len = len(tokenizer.encode(goal_state))
+                if ctx_len > max_seq_len or goal_len > max_seq_len:
                     skipped += 1
                     continue
 
-                self.pairs.append((context, target, premise, conclusion))
+                self.pairs.append((context, target, premise, goal_state))
 
         print(f"  JEPADataset: {len(self.pairs)} context→target pairs"
               f" ({skipped} skipped due to truncation)")
@@ -221,7 +227,7 @@ class JEPADataset(Dataset):
         return len(self.pairs)
 
     def __getitem__(self, idx):
-        context, target, premise, conclusion = self.pairs[idx]
+        context, target, premise, goal_state = self.pairs[idx]
 
         ctx = self.tokenizer(
             context,
@@ -244,8 +250,8 @@ class JEPADataset(Dataset):
             truncation=True,
             return_tensors="pt",
         )
-        concl = self.tokenizer(
-            conclusion,
+        goal = self.tokenizer(
+            goal_state,
             max_length=self.max_seq_len,
             padding="max_length",
             truncation=True,
@@ -259,8 +265,8 @@ class JEPADataset(Dataset):
             "target_mask": tgt["attention_mask"].squeeze(0),
             "premise_ids": prem["input_ids"].squeeze(0),
             "premise_mask": prem["attention_mask"].squeeze(0),
-            "conclusion_ids": concl["input_ids"].squeeze(0),
-            "conclusion_mask": concl["attention_mask"].squeeze(0),
+            "goal_ids": goal["input_ids"].squeeze(0),
+            "goal_mask": goal["attention_mask"].squeeze(0),
         }
 
 
@@ -320,6 +326,7 @@ class DecoderDataset(Dataset):
         # Load trajectories
         data = torch.load(trajectory_path, weights_only=False)
         self.trajectories = data["Z_true"]         # [num_problems, N, d]
+        self.active_masks = data["active_masks"]   # [num_problems, N]
         self.problem_indices = data["problem_indices"]  # maps trajectory → problem
 
         # Tokenize solutions
@@ -341,6 +348,7 @@ class DecoderDataset(Dataset):
             self.items.append(
                 {
                     "trajectory_idx": i,
+                    "problem_idx": prob_idx,
                     "token_ids": tokens["input_ids"].squeeze(0),
                     "token_mask": tokens["attention_mask"].squeeze(0),
                 }
@@ -354,6 +362,7 @@ class DecoderDataset(Dataset):
     def __getitem__(self, idx):
         item = self.items[idx]
         trajectory = self.trajectories[item["trajectory_idx"]]
+        active_mask = self.active_masks[item["trajectory_idx"]]
         token_ids = item["token_ids"]
         token_mask = item["token_mask"]
 
@@ -364,6 +373,8 @@ class DecoderDataset(Dataset):
 
         return {
             "trajectory": trajectory,
+            "active_mask": active_mask,
+            "problem_idx": item["problem_idx"],
             "input_ids": input_ids,
             "target_ids": token_ids,
             "target_mask": token_mask,

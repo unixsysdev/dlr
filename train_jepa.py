@@ -6,7 +6,7 @@ representation, using VICReg loss for structural anti-collapse.
 Simultaneously trains the Oracle to predict z_final from z_0.
 
 Loss:
-  L_total = L_vicreg(z_pred, z_target) + λ_oracle · L_oracle(ẑ_final, z_target)
+  L_total = L_vicreg(z_pred, z_target) + λ_oracle · L_oracle(ẑ_goal, z_goal)
 
 Monitoring:
   - VICReg sub-losses: invariance, variance, covariance
@@ -153,10 +153,10 @@ def train_jepa(config: DLRConfig) -> dict:
                     # NO intermediate steps — matches inference behavior
                     premise_ids=batch["premise_ids"],
                     premise_mask=batch["premise_mask"],
-                    # Conclusion tokens: Oracle's TRUE target (final proof step)
-                    # NOT step k+1 — the actual conclusion of the proof
-                    conclusion_ids=batch["conclusion_ids"],
-                    conclusion_mask=batch["conclusion_mask"],
+                    # Goal-state tokens: the Oracle target now matches the
+                    # exact full-proof endpoint used by trajectory extraction.
+                    goal_ids=batch["goal_ids"],
+                    goal_mask=batch["goal_mask"],
                 )
 
                 z_predicted = result["z_predicted"]

@@ -26,6 +26,12 @@ except ImportError:
     HAS_UMAP = False
     print("  ⚠ umap-learn not installed, falling back to t-SNE")
 
+try:
+    import sympy
+    HAS_SYMPY = True
+except ImportError:
+    HAS_SYMPY = False
+
 from sklearn.manifold import TSNE
 
 
@@ -258,7 +264,10 @@ def plot_flow_training(data_dir: str, plot_dir: str):
     with open(history_path) as f:
         history = json.load(f)
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    has_stop_metrics = "stop_acc" in history and len(history["stop_acc"]) > 0
+    fig, axes = plt.subplots(1, 3 if has_stop_metrics else 2, figsize=(18 if has_stop_metrics else 14, 5))
+    if not isinstance(axes, np.ndarray):
+        axes = np.array([axes])
 
     # Per-step loss
     axes[0].plot(history["loss"], alpha=0.2, color="#00d4ff", linewidth=0.5)
@@ -276,6 +285,16 @@ def plot_flow_training(data_dir: str, plot_dir: str):
     axes[1].set_xlabel("Epoch")
     axes[1].set_ylabel("Avg Masked MSE")
     axes[1].set_yscale("log")
+
+    if has_stop_metrics:
+        axes[2].plot(history["stop_acc"], alpha=0.3, color="#00ff88", linewidth=0.8)
+        window = max(len(history["stop_acc"]) // 50, 1)
+        smoothed = np.convolve(history["stop_acc"], np.ones(window) / window, mode="valid")
+        axes[2].plot(smoothed, color="#00ff88", linewidth=2)
+        axes[2].set_title("Stop Prediction Accuracy", fontweight="bold")
+        axes[2].set_xlabel("Step")
+        axes[2].set_ylabel("Accuracy")
+        axes[2].set_ylim(0, 1.05)
 
     fig.suptitle("Phase 2: Rectified Flow Training", fontsize=16, fontweight="bold")
     plt.tight_layout()
@@ -385,6 +404,27 @@ def normalize_answer(text: str) -> str:
     return re.sub(r"\s+", "", text.strip())
 
 
+def symbolic_answer_equivalent(answer_a: str, answer_b: str) -> bool:
+    """
+    Try to verify algebraic equivalence of two extracted answers.
+
+    This is intentionally conservative: if parsing fails, we return False
+    rather than pretending the answer was verified.
+    """
+    if not HAS_SYMPY or not answer_a or not answer_b:
+        return False
+
+    expr_a = answer_a.split("=", 1)[-1]
+    expr_b = answer_b.split("=", 1)[-1]
+
+    try:
+        sym_a = sympy.sympify(expr_a)
+        sym_b = sympy.sympify(expr_b)
+        return bool(sympy.simplify(sym_a - sym_b) == 0)
+    except Exception:
+        return False
+
+
 def evaluate_token_recovery(
     decoder_model,
     data_dir: str,
@@ -403,6 +443,7 @@ def evaluate_token_recovery(
     device = config.device
 
     Z_true = data["Z_true"][:n_samples].to(device)
+    active_masks = data["active_masks"][:n_samples].to(device)
     indices = data["problem_indices"][:n_samples]
 
     decoder_model.eval()
@@ -418,6 +459,7 @@ def evaluate_token_recovery(
             eos_token_id=eos_id,
             max_length=config.decoder_max_seq_len,
             temperature=config.eval_temperature,
+            trajectory_mask=active_masks[i : i + 1],
         )
 
         gen_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
@@ -544,11 +586,12 @@ def evaluate_full_pipeline(
         with torch.no_grad():
             z_0, _ = jepa_model.encode(tokens["input_ids"], tokens["attention_mask"])
             z_hat_final = jepa_model.predict_goal(z_0)
-            Z_gen = flow_model.generate(
+            Z_gen, active_mask = flow_model.generate(
                 z_0,
                 z_hat_final,
                 n_steps=config.ode_steps,
                 solver=config.ode_solver,
+                return_mask=True,
             )
             generated_ids = decoder_model.generate(
                 Z_gen,
@@ -556,6 +599,7 @@ def evaluate_full_pipeline(
                 eos_token_id=eos_id,
                 max_length=config.decoder_max_seq_len,
                 temperature=config.eval_temperature,
+                trajectory_mask=active_mask,
             )
 
         gen_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
@@ -567,6 +611,9 @@ def evaluate_full_pipeline(
         final_answer_exact_match = int(
             bool(gen_final_answer)
             and normalize_answer(gen_final_answer) == normalize_answer(gt_final_answer)
+        )
+        final_answer_symbolic_match = int(
+            symbolic_answer_equivalent(gen_final_answer, gt_final_answer)
         )
 
         if gt_tokens:
@@ -586,6 +633,7 @@ def evaluate_full_pipeline(
             "generated_final_answer": gen_final_answer,
             "ground_truth_final_answer": gt_final_answer,
             "final_answer_exact_match": final_answer_exact_match,
+            "final_answer_symbolic_match": final_answer_symbolic_match,
         })
 
     if not results:
@@ -595,6 +643,7 @@ def evaluate_full_pipeline(
     # Plot
     rates = [r["recovery_rate"] for r in results]
     answer_matches = [r["final_answer_exact_match"] for r in results]
+    symbolic_matches = [r["final_answer_symbolic_match"] for r in results]
     fig, axes = plt.subplots(1, 2, figsize=(16, 5))
 
     axes[0].bar(range(len(rates)), rates, color="#ff6b6b", alpha=0.8)
@@ -624,6 +673,10 @@ def evaluate_full_pipeline(
     print(f"  ✓ Saved 08_full_pipeline_recovery.png")
     print(f"    Mean full-pipeline recovery: {np.mean(rates):.2%}")
     print(f"    Final answer exact match: {np.mean(answer_matches):.2%}")
+    if HAS_SYMPY:
+        print(f"    Final answer symbolic match: {np.mean(symbolic_matches):.2%}")
+    else:
+        print("    Final answer symbolic match: unavailable (sympy not installed)")
 
     # Print samples
     print("\n  ── Full Pipeline Samples (Honest) ──")
@@ -634,7 +687,8 @@ def evaluate_full_pipeline(
         print(f"    Recovered: {r['recovered']} ({r['recovery_rate']:.0%})")
         print(f"    Final answer: GT={r['ground_truth_final_answer']!r} | "
               f"Gen={r['generated_final_answer']!r} | "
-              f"EM={bool(r['final_answer_exact_match'])}")
+              f"EM={bool(r['final_answer_exact_match'])} | "
+              f"SYM={bool(r['final_answer_symbolic_match'])}")
 
     # Save
     results_path = os.path.join(config.data_dir, "full_pipeline_results.json")
@@ -657,7 +711,10 @@ def plot_decoder_training(data_dir: str, plot_dir: str):
     with open(history_path) as f:
         history = json.load(f)
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    has_mix_history = "generated_fraction" in history and len(history["generated_fraction"]) > 0
+    fig, axes = plt.subplots(1, 3 if has_mix_history else 2, figsize=(18 if has_mix_history else 14, 5))
+    if not isinstance(axes, np.ndarray):
+        axes = np.array([axes])
 
     # Loss
     axes[0].plot(history["loss"], alpha=0.2, color="#00d4ff", linewidth=0.5)
@@ -675,6 +732,20 @@ def plot_decoder_training(data_dir: str, plot_dir: str):
     axes[1].set_xlabel("Epoch")
     axes[1].set_ylabel("Perplexity")
     axes[1].set_yscale("log")
+
+    if has_mix_history:
+        axes[2].plot(history["generated_fraction"], alpha=0.3, color="#00ff88", linewidth=0.8)
+        window = max(len(history["generated_fraction"]) // 50, 1)
+        smoothed = np.convolve(
+            history["generated_fraction"],
+            np.ones(window) / window,
+            mode="valid",
+        )
+        axes[2].plot(smoothed, color="#00ff88", linewidth=2)
+        axes[2].set_title("Generated Trajectory Fraction", fontweight="bold")
+        axes[2].set_xlabel("Step")
+        axes[2].set_ylabel("Fraction")
+        axes[2].set_ylim(0, 1.05)
 
     fig.suptitle("Phase 3: Scribe Decoder Training", fontsize=16, fontweight="bold")
     plt.tight_layout()

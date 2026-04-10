@@ -53,7 +53,9 @@ class DLRConfig:
     decoder_weight_decay: float = 0.01
     decoder_max_seq_len: int = 256  # Decoder output max tokens
     decoder_window_half: int = 2    # Sliding window half-width
-    use_gt_trajectories: bool = True  # Use Z_true instead of generated
+    use_gt_trajectories: bool = True  # False = generated trajectories only
+    decoder_generated_mix_start: float = 0.0  # Fraction of generated trajs at epoch 0
+    decoder_generated_mix_end: float = 0.5    # Fraction of generated trajs at final epoch
 
     # ── VICReg (Anti-Collapse) ─────────────────────────────────────
     vicreg_lambda_inv: float = 25.0   # Invariance (MSE) weight
@@ -73,6 +75,7 @@ class DLRConfig:
     energy_noise_std: float = 0.5     # Std for negative samples
     energy_penalty_weight: float = 0.1  # α in flow loss
     energy_lr: float = 1e-4           # Critic learning rate
+    stop_loss_weight: float = 0.2     # Weight for trajectory stop prediction
 
     # ── ODE Solver ──────────────────────────────────────────────────
     ode_steps: int = 50          # Euler integration steps
@@ -172,6 +175,8 @@ def production_config() -> DLRConfig:
         decoder_weight_decay=0.01,
         decoder_max_seq_len=1024,
         decoder_window_half=3,
+        decoder_generated_mix_start=0.1,
+        decoder_generated_mix_end=0.75,
 
         # VICReg
         vicreg_lambda_inv=25.0,
@@ -191,6 +196,7 @@ def production_config() -> DLRConfig:
         energy_noise_std=0.5,
         energy_penalty_weight=0.1,
         energy_lr=5e-5,
+        stop_loss_weight=0.2,
 
         # ODE
         ode_steps=100,

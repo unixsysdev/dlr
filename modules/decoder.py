@@ -49,6 +49,7 @@ class DecoderLayer(nn.Module):
         trajectory: torch.Tensor,
         causal_mask: torch.Tensor,
         sw_mask: torch.Tensor,
+        trajectory_mask: torch.Tensor = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -56,6 +57,7 @@ class DecoderLayer(nn.Module):
             trajectory: [B, N, d] waypoint trajectory
             causal_mask: [L, L] float mask (-inf=blocked, 0=allowed)
             sw_mask: [L, N] float sliding window mask
+            trajectory_mask: [B, N] binary mask (1=active, 0=inactive)
         """
         # Self-attention (causal)
         h = self.norm1(x)
@@ -63,7 +65,16 @@ class DecoderLayer(nn.Module):
 
         # Cross-attention (sliding window) to trajectory
         h = self.norm2(x)
-        x = x + self.cross_attn(h, trajectory, trajectory, attn_mask=sw_mask)[0]
+        key_padding_mask = None
+        if trajectory_mask is not None:
+            key_padding_mask = trajectory_mask == 0
+        x = x + self.cross_attn(
+            h,
+            trajectory,
+            trajectory,
+            attn_mask=sw_mask,
+            key_padding_mask=key_padding_mask,
+        )[0]
 
         # FFN
         h = self.norm3(x)
@@ -154,6 +165,7 @@ class ScribeDecoder(nn.Module):
         self,
         input_ids: torch.Tensor,
         trajectory: torch.Tensor,
+        trajectory_mask: torch.Tensor = None,
     ) -> torch.Tensor:
         """
         Teacher-forcing forward pass.
@@ -161,6 +173,7 @@ class ScribeDecoder(nn.Module):
         Args:
             input_ids: [B, L] input token IDs (BOS + shifted target)
             trajectory: [B, N, d] waypoint trajectory
+            trajectory_mask: [B, N] binary mask for active waypoints
 
         Returns:
             logits: [B, L, vocab_size]
@@ -178,7 +191,7 @@ class ScribeDecoder(nn.Module):
 
         # Process through decoder layers
         for layer in self.layers:
-            x = layer(x, trajectory, causal_mask, sw_mask)
+            x = layer(x, trajectory, causal_mask, sw_mask, trajectory_mask)
 
         # Output logits
         x = self.norm(x)
@@ -193,6 +206,7 @@ class ScribeDecoder(nn.Module):
         eos_token_id: int,
         max_length: int = 256,
         temperature: float = 0.8,
+        trajectory_mask: torch.Tensor = None,
     ) -> torch.Tensor:
         """
         Autoregressive generation from a trajectory.
@@ -203,6 +217,7 @@ class ScribeDecoder(nn.Module):
             eos_token_id: end-of-sequence token ID
             max_length: maximum generation length
             temperature: sampling temperature
+            trajectory_mask: [B, N] binary mask for active waypoints
 
         Returns:
             generated_ids: [B, L] generated token IDs
@@ -214,7 +229,11 @@ class ScribeDecoder(nn.Module):
         generated = torch.full((B, 1), bos_token_id, dtype=torch.long, device=device)
 
         for _ in range(max_length - 1):
-            logits = self.forward(generated, trajectory)  # [B, L, V]
+            logits = self.forward(
+                generated,
+                trajectory,
+                trajectory_mask=trajectory_mask,
+            )  # [B, L, V]
             if temperature <= 1e-4:
                 next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
             else:

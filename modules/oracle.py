@@ -1,7 +1,7 @@
 """
 The Oracle — Macroscopic Goal State Predictor
 
-Predicts ẑ_final (the conclusion of a proof) from z_0 (the premise).
+Predicts ẑ_final (the final cumulative goal state of a proof) from z_0 (the premise).
 This eliminates target leakage: at inference, the system only has the
 premise, so it must autonomously predict where the proof should end.
 
@@ -11,7 +11,7 @@ a shallow MLP cannot learn this mapping. Each residual block provides
 a non-linear "reasoning hop" that incrementally transforms the premise
 toward the predicted goal.
 
-Loss: L_oracle = ||ẑ_final - sg(z_final)||² trained alongside the JEPA.
+Loss: L_oracle = ||ẑ_final - sg(z_goal)||² trained alongside the JEPA.
 """
 
 import torch
@@ -42,7 +42,7 @@ class Oracle(nn.Module):
     """
     Predicts ẑ_final from z_0 (premise only).
 
-    The premise → conclusion leap is far harder than the step → step
+    The premise → goal-state leap is far harder than the step → step
     prediction (which the micro-Predictor handles). This requires a
     deeper network with skip connections at every layer.
 

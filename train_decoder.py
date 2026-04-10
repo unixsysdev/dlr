@@ -27,15 +27,101 @@ except ImportError:
 
 from config import DLRConfig
 from modules.decoder import ScribeDecoder
+from modules.flow_expert import FlowExpert
+from modules.text_jepa import TextJEPA
 from data_pipeline import (
     load_dataset_split,
     parse_all_problems,
     prepare_tokenizer,
     DecoderDataset,
+    format_premise,
 )
 
 
-def train_decoder(config: DLRConfig, parsed_problems: list = None) -> dict:
+def _load_frozen_generation_models(
+    config: DLRConfig,
+    jepa_model=None,
+    flow_model=None,
+):
+    """Load frozen JEPA + Flow models for generated-trajectory decoder training."""
+    device = config.device
+
+    if jepa_model is None:
+        print("  Loading frozen JEPA for decoder trajectory generation...")
+        ckpt = torch.load(
+            os.path.join(config.checkpoint_dir, "jepa_final.pt"),
+            map_location=device,
+            weights_only=False,
+        )
+        jepa_model = TextJEPA(
+            vocab_size=ckpt["vocab_size"],
+            d_model=config.d_model,
+            n_heads=config.n_heads,
+            n_layers=config.encoder_layers,
+            predictor_hidden=config.predictor_hidden,
+            dropout=0.0,
+            ff_mult=config.ff_mult,
+            max_len=config.max_seq_len,
+            oracle_layers=config.oracle_layers,
+            oracle_expansion=config.oracle_expansion,
+        ).to(device)
+        jepa_model.load_state_dict(ckpt["model_state_dict"])
+
+    if flow_model is None:
+        print("  Loading frozen Flow Expert for decoder trajectory generation...")
+        ckpt = torch.load(
+            os.path.join(config.checkpoint_dir, "flow_final.pt"),
+            map_location=device,
+            weights_only=False,
+        )
+        flow_model = FlowExpert(
+            d_model=config.d_model,
+            n_heads=config.n_heads,
+            n_layers=config.flow_layers,
+            n_waypoints=config.n_waypoints,
+            ff_mult=config.ff_mult,
+            dropout=0.0,
+        ).to(device)
+        incompatible = flow_model.load_state_dict(
+            ckpt["model_state_dict"], strict=False
+        )
+        if incompatible.missing_keys or incompatible.unexpected_keys:
+            print(
+                "  ⚠ Flow checkpoint missing keys for current architecture: "
+                f"missing={incompatible.missing_keys}, "
+                f"unexpected={incompatible.unexpected_keys}"
+            )
+
+    jepa_model.eval()
+    flow_model.eval()
+    for p in jepa_model.parameters():
+        p.requires_grad = False
+    for p in flow_model.parameters():
+        p.requires_grad = False
+
+    return jepa_model, flow_model
+
+
+def _generated_mix_rate(config: DLRConfig, epoch: int) -> float:
+    """Linear schedule from mostly clean trajectories to more generated ones."""
+    if not config.use_gt_trajectories:
+        return 1.0
+    if config.decoder_epochs <= 1:
+        return config.decoder_generated_mix_end
+    progress = epoch / max(config.decoder_epochs - 1, 1)
+    mix_rate = (
+        config.decoder_generated_mix_start
+        + progress * (config.decoder_generated_mix_end - config.decoder_generated_mix_start)
+    )
+    return float(min(max(mix_rate, 0.0), 1.0))
+
+
+def train_decoder(
+    config: DLRConfig,
+    parsed_problems: list = None,
+    jepa_model=None,
+    flow_model=None,
+) -> dict:
     """
     Train the Scribe Decoder and return training history.
 
@@ -107,6 +193,17 @@ def train_decoder(config: DLRConfig, parsed_problems: list = None) -> dict:
 
     pad_id = tokenizer.pad_token_id
 
+    needs_generated_trajectories = (
+        (not config.use_gt_trajectories)
+        or max(config.decoder_generated_mix_start, config.decoder_generated_mix_end) > 0.0
+    )
+    if needs_generated_trajectories:
+        jepa_model, flow_model = _load_frozen_generation_models(
+            config,
+            jepa_model=jepa_model,
+            flow_model=flow_model,
+        )
+
     # Determine loss function
     use_liger = config.use_liger and HAS_LIGER and config.device == "cuda"
     if use_liger:
@@ -121,7 +218,12 @@ def train_decoder(config: DLRConfig, parsed_problems: list = None) -> dict:
 
     # ── Training Loop ───────────────────────────────────────────
     print(f"\n[4/4] Training for {config.decoder_epochs} epochs...")
-    history = {"loss": [], "epoch_loss": [], "perplexity": []}
+    history = {
+        "loss": [],
+        "epoch_loss": [],
+        "perplexity": [],
+        "generated_fraction": [],
+    }
     t_start = time.time()
 
     for epoch in range(config.decoder_epochs):
@@ -129,6 +231,8 @@ def train_decoder(config: DLRConfig, parsed_problems: list = None) -> dict:
         epoch_loss = 0.0
         epoch_tokens = 0
         n_batches = 0
+        mix_rate = _generated_mix_rate(config, epoch)
+        print(f"  Epoch {epoch+1}: generated trajectory mix = {mix_rate:.0%}")
 
         pbar = tqdm(
             dataloader,
@@ -137,13 +241,67 @@ def train_decoder(config: DLRConfig, parsed_problems: list = None) -> dict:
         )
         for batch in pbar:
             trajectory = batch["trajectory"].to(device)   # [B, N, d]
+            trajectory_mask = batch["active_mask"].to(device)  # [B, N]
             input_ids = batch["input_ids"].to(device)     # [B, L]
             target_ids = batch["target_ids"].to(device)   # [B, L]
             target_mask = batch["target_mask"].to(device)  # [B, L]
+            problem_idx = batch["problem_idx"]
+
+            if needs_generated_trajectories and mix_rate > 0.0:
+                batch_size = trajectory.shape[0]
+                use_generated = torch.rand(batch_size, device=device) < mix_rate
+                if mix_rate >= 1.0 - 1e-6:
+                    use_generated = torch.ones(batch_size, dtype=torch.bool, device=device)
+
+                if use_generated.any():
+                    if torch.is_tensor(problem_idx):
+                        problem_idx_list = problem_idx.tolist()
+                    else:
+                        problem_idx_list = list(problem_idx)
+
+                    selected = use_generated.nonzero(as_tuple=True)[0]
+                    premise_texts = [
+                        format_premise(parsed_problems[problem_idx_list[i]]["problem"])
+                        for i in selected.tolist()
+                    ]
+                    premise_tokens = tokenizer(
+                        premise_texts,
+                        max_length=config.max_seq_len,
+                        padding="max_length",
+                        truncation=True,
+                        return_tensors="pt",
+                    ).to(device)
+
+                    with torch.no_grad():
+                        z_0, _ = jepa_model.encode(
+                            premise_tokens["input_ids"],
+                            premise_tokens["attention_mask"],
+                        )
+                        z_hat_final = jepa_model.predict_goal(z_0)
+                        generated_trajectory, generated_mask = flow_model.generate(
+                            z_0,
+                            z_hat_final,
+                            n_steps=config.ode_steps,
+                            solver=config.ode_solver,
+                            return_mask=True,
+                        )
+
+                    trajectory = trajectory.clone()
+                    trajectory_mask = trajectory_mask.clone()
+                    trajectory[selected] = generated_trajectory
+                    trajectory_mask[selected] = generated_mask
+            else:
+                use_generated = torch.zeros(
+                    trajectory.shape[0], dtype=torch.bool, device=device
+                )
 
             # Forward (BF16 autocast)
             with config.autocast_ctx:
-                logits = model(input_ids, trajectory)  # [B, L, V]
+                logits = model(
+                    input_ids,
+                    trajectory,
+                    trajectory_mask=trajectory_mask,
+                )  # [B, L, V]
 
                 # Cross-entropy loss (Liger fused or standard)
                 if use_liger:
@@ -170,10 +328,14 @@ def train_decoder(config: DLRConfig, parsed_problems: list = None) -> dict:
             n_tokens = target_mask.sum().item()
 
             history["loss"].append(loss.item())
+            history["generated_fraction"].append(use_generated.float().mean().item())
             epoch_loss += loss.item() * n_tokens
             epoch_tokens += n_tokens
             n_batches += 1
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
+            pbar.set_postfix(
+                loss=f"{loss.item():.4f}",
+                gen=f"{use_generated.float().mean().item():.2f}",
+            )
 
         avg_loss = epoch_loss / max(epoch_tokens, 1)
         perplexity = min(torch.exp(torch.tensor(avg_loss)).item(), 1e6)
