@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+checkpoints/
+data/
+plots/
+*.pt
+*.bin
+wandb/
+.ipynb_checkpoints/

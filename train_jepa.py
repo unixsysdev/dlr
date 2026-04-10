@@ -1,0 +1,228 @@
+"""
+Phase 1: Train the Text-JEPA
+
+Trains the JEPA to predict the next reasoning step's
+latent representation from the current context.
+
+Monitoring:
+  - Loss curve (should decrease monotonically)
+  - z_var (MUST stay > collapse_threshold, else space collapsed)
+  - EMA tau schedule
+"""
+
+import os
+import json
+import time
+import torch
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+from config import DLRConfig
+from modules.text_jepa import TextJEPA
+from data_pipeline import (
+    load_dataset_split,
+    parse_all_problems,
+    prepare_tokenizer,
+    JEPADataset,
+)
+
+
+def train_jepa(config: DLRConfig) -> dict:
+    """
+    Train the Text-JEPA and return training history.
+
+    Returns:
+        dict with model, tokenizer, parsed_problems, and history
+    """
+    print("=" * 60)
+    print("PHASE 1: Training Text-JEPA")
+    print("=" * 60)
+
+    # ── Setup ───────────────────────────────────────────────────
+    torch.manual_seed(config.seed)
+    os.makedirs(config.checkpoint_dir, exist_ok=True)
+    os.makedirs(config.data_dir, exist_ok=True)
+    config.apply_compute_optimizations()
+
+    # Tokenizer
+    print("\n[1/4] Preparing tokenizer...")
+    tokenizer = prepare_tokenizer()
+    vocab_size = len(tokenizer)
+    print(f"  Vocab size (with special tokens): {vocab_size}")
+
+    # Dataset
+    print("\n[2/4] Loading and parsing dataset...")
+    raw_dataset = load_dataset_split(config.dataset_name, config.n_samples)
+    parsed = parse_all_problems(raw_dataset, config.min_steps, config.max_steps)
+    print(f"  Parsed {len(parsed)} problems with valid step counts")
+
+    if len(parsed) == 0:
+        raise RuntimeError("No valid problems found! Check min_steps/max_steps.")
+
+    jepa_dataset = JEPADataset(parsed, tokenizer, config.max_seq_len)
+    dataloader = DataLoader(
+        jepa_dataset,
+        batch_size=config.jepa_batch_size,
+        shuffle=True,
+        num_workers=config.num_workers,
+        pin_memory=config.pin_memory,
+        persistent_workers=config.persistent_workers and config.num_workers > 0,
+        drop_last=False,
+    )
+
+    # Model
+    print("\n[3/4] Building Text-JEPA...")
+    model = TextJEPA(
+        vocab_size=vocab_size,
+        d_model=config.d_model,
+        n_heads=config.n_heads,
+        n_layers=config.encoder_layers,
+        predictor_hidden=config.predictor_hidden,
+        dropout=config.dropout,
+        ff_mult=config.ff_mult,
+        max_len=config.max_seq_len,
+    ).to(config.device)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.trainable_parameters())
+    print(f"  Total params: {total_params:,}")
+    print(f"  Trainable params: {trainable_params:,}")
+    print(f"  Target encoder params (EMA, frozen): {total_params - trainable_params:,}")
+
+    # Optimizer (only context encoder + predictor)
+    optimizer = torch.optim.AdamW(
+        model.trainable_parameters(),
+        lr=config.jepa_lr,
+        weight_decay=config.jepa_weight_decay,
+    )
+
+    # ── Compute: torch.compile ──────────────────────────────────
+    # NOTE: We compile the full model but only optimize context_encoder + predictor.
+    # EMA updates operate on the raw (uncompiled) parameters via model._orig_mod
+    # if compiled, so we keep a reference to the uncompiled model for EMA.
+    raw_model = model
+    model = config.maybe_compile(model)
+
+    total_steps = len(dataloader) * config.jepa_epochs
+
+    # ── Training Loop ───────────────────────────────────────────
+    print(f"\n[4/4] Training for {config.jepa_epochs} epochs "
+          f"({total_steps} steps)...")
+    print(f"  EMA schedule: {config.ema_start} → {config.ema_end} (cosine)")
+
+    history = {"loss": [], "z_var": [], "ema_tau": [], "epoch_loss": []}
+    global_step = 0
+    collapsed = False
+    t_start = time.time()
+
+    for epoch in range(config.jepa_epochs):
+        model.train()
+        epoch_loss = 0.0
+        epoch_z_var = 0.0
+        n_batches = 0
+
+        pbar = tqdm(dataloader, desc=f"  Epoch {epoch+1}/{config.jepa_epochs}")
+        for batch in pbar:
+            # Move to device
+            batch = {k: v.to(config.device) for k, v in batch.items()}
+
+            # Forward (BF16 autocast for speed)
+            with config.autocast_ctx:
+                loss, z_var, _ = model(
+                    batch["context_ids"],
+                    batch["context_mask"],
+                    batch["target_ids"],
+                    batch["target_mask"],
+                )
+
+            # Backward
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                raw_model.trainable_parameters(), config.grad_clip
+            )
+            optimizer.step()
+
+            # EMA update (always FP32, on raw uncompiled model)
+            tau = config.ema_schedule(global_step, total_steps)
+            raw_model.ema_update(tau)
+
+            # ── Collapse Detection ──────────────────────────────
+            if z_var < config.collapse_threshold:
+                print(f"\n  ⚠️  COLLAPSE DETECTED at step {global_step}!")
+                print(f"      z_var = {z_var:.8f} < threshold {config.collapse_threshold}")
+                print(f"      EMA tau = {tau:.6f}")
+                collapsed = True
+
+            # Logging
+            history["loss"].append(loss.item())
+            history["z_var"].append(z_var)
+            history["ema_tau"].append(tau)
+
+            epoch_loss += loss.item()
+            epoch_z_var += z_var
+            n_batches += 1
+            global_step += 1
+
+            pbar.set_postfix(
+                loss=f"{loss.item():.4f}",
+                z_var=f"{z_var:.4f}",
+                tau=f"{tau:.4f}",
+            )
+
+        avg_loss = epoch_loss / max(n_batches, 1)
+        avg_z_var = epoch_z_var / max(n_batches, 1)
+        history["epoch_loss"].append(avg_loss)
+
+        elapsed = time.time() - t_start
+        print(
+            f"  Epoch {epoch+1} | Loss: {avg_loss:.4f} | "
+            f"z_var: {avg_z_var:.4f} | tau: {tau:.6f} | "
+            f"Time: {elapsed:.0f}s"
+        )
+
+    # Save (always save raw uncompiled model)
+    checkpoint_path = os.path.join(config.checkpoint_dir, "jepa_final.pt")
+    torch.save(
+        {
+            "model_state_dict": raw_model.state_dict(),
+            "vocab_size": vocab_size,
+            "config": {
+                "d_model": config.d_model,
+                "n_heads": config.n_heads,
+                "encoder_layers": config.encoder_layers,
+                "predictor_hidden": config.predictor_hidden,
+            },
+        },
+        checkpoint_path,
+    )
+    print(f"\n  ✓ JEPA saved to {checkpoint_path}")
+
+    # Save tokenizer
+    tokenizer_path = os.path.join(config.checkpoint_dir, "tokenizer")
+    tokenizer.save_pretrained(tokenizer_path)
+    print(f"  ✓ Tokenizer saved to {tokenizer_path}")
+
+    # Save history
+    history_path = os.path.join(config.data_dir, "jepa_history.json")
+    with open(history_path, "w") as f:
+        json.dump(history, f)
+
+    total_time = time.time() - t_start
+    print(f"\n  Phase 1 complete in {total_time/60:.1f} minutes")
+    if collapsed:
+        print("  ⚠️  WARNING: Collapse was detected during training!")
+        print("  → Consider adjusting EMA schedule or learning rate")
+
+    return {
+        "model": model,
+        "tokenizer": tokenizer,
+        "parsed_problems": parsed,
+        "history": history,
+        "collapsed": collapsed,
+    }
+
+
+if __name__ == "__main__":
+    config = DLRConfig()
+    train_jepa(config)
