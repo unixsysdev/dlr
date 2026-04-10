@@ -425,6 +425,53 @@ def symbolic_answer_equivalent(answer_a: str, answer_b: str) -> bool:
         return False
 
 
+def extract_equations(text: str) -> List[str]:
+    """Extract simple equation-like snippets for lightweight step validation."""
+    pattern = r"[A-Za-z0-9_().+\-*/^ ]+\s*=\s*[A-Za-z0-9_().+\-*/^ ]+"
+    return [eq.strip() for eq in re.findall(pattern, text)]
+
+
+def symbolic_equation_equivalent(equation_a: str, equation_b: str) -> bool:
+    """
+    Conservative algebraic equivalence check for two equations.
+
+    We only score a pair when both sides parse cleanly; otherwise the verifier
+    abstains instead of inventing a correctness signal.
+    """
+    if not HAS_SYMPY or "=" not in equation_a or "=" not in equation_b:
+        return False
+
+    lhs_a, rhs_a = [part.strip() for part in equation_a.split("=", 1)]
+    lhs_b, rhs_b = [part.strip() for part in equation_b.split("=", 1)]
+
+    try:
+        delta_a = sympy.simplify(sympy.sympify(lhs_a) - sympy.sympify(rhs_a))
+        delta_b = sympy.simplify(sympy.sympify(lhs_b) - sympy.sympify(rhs_b))
+        return bool(sympy.simplify(delta_a - delta_b) == 0)
+    except Exception:
+        return False
+
+
+def equation_consistency_rate(generated_text: str, ground_truth_text: str) -> float:
+    """
+    Compare generated equations against the ground-truth proof's equation set.
+
+    This is a weak verifier, but it is materially stronger than token overlap:
+    it asks whether generated algebraic statements land on the same equivalence
+    classes as equations in the reference solution.
+    """
+    gt_equations = extract_equations(ground_truth_text)
+    gen_equations = extract_equations(generated_text)
+    if not HAS_SYMPY or not gt_equations or not gen_equations:
+        return 0.0
+
+    consistent = 0
+    for gen_eq in gen_equations:
+        if any(symbolic_equation_equivalent(gen_eq, gt_eq) for gt_eq in gt_equations):
+            consistent += 1
+    return consistent / max(len(gen_equations), 1)
+
+
 def evaluate_token_recovery(
     decoder_model,
     data_dir: str,
@@ -547,7 +594,7 @@ def evaluate_full_pipeline(
     parsed_problems_test: list,
     tokenizer,
     config,
-    n_samples: int = 10,
+    n_samples: int = None,
 ):
     """
     Metric E: The honest test. Zero oracle leakage.
@@ -560,6 +607,8 @@ def evaluate_full_pipeline(
         5. Compare against ground truth
     """
     device = config.device
+    if n_samples is None:
+        n_samples = min(config.full_pipeline_eval_samples, len(parsed_problems_test))
 
     jepa_model.eval()
     flow_model.eval()
@@ -615,6 +664,7 @@ def evaluate_full_pipeline(
         final_answer_symbolic_match = int(
             symbolic_answer_equivalent(gen_final_answer, gt_final_answer)
         )
+        equation_consistency = equation_consistency_rate(gen_text, gt_text)
 
         if gt_tokens:
             recovered = gen_tokens & gt_tokens
@@ -634,6 +684,7 @@ def evaluate_full_pipeline(
             "ground_truth_final_answer": gt_final_answer,
             "final_answer_exact_match": final_answer_exact_match,
             "final_answer_symbolic_match": final_answer_symbolic_match,
+            "equation_consistency": equation_consistency,
         })
 
     if not results:
@@ -644,7 +695,8 @@ def evaluate_full_pipeline(
     rates = [r["recovery_rate"] for r in results]
     answer_matches = [r["final_answer_exact_match"] for r in results]
     symbolic_matches = [r["final_answer_symbolic_match"] for r in results]
-    fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+    equation_consistencies = [r["equation_consistency"] for r in results]
+    fig, axes = plt.subplots(1, 3, figsize=(22, 5))
 
     axes[0].bar(range(len(rates)), rates, color="#ff6b6b", alpha=0.8)
     axes[0].axhline(y=np.mean(rates), color="#ffcc00", linestyle="--",
@@ -665,6 +717,19 @@ def evaluate_full_pipeline(
     axes[1].set_ylim(0, 1.1)
     axes[1].legend()
 
+    axes[2].bar(range(len(equation_consistencies)), equation_consistencies, color="#00d4ff", alpha=0.8)
+    axes[2].axhline(
+        y=np.mean(equation_consistencies),
+        color="#ffcc00",
+        linestyle="--",
+        label=f"Equation consistency: {np.mean(equation_consistencies):.2%}",
+    )
+    axes[2].set_title("Equation Consistency", fontweight="bold")
+    axes[2].set_xlabel("Problem")
+    axes[2].set_ylabel("Consistency")
+    axes[2].set_ylim(0, 1.1)
+    axes[2].legend()
+
     plt.tight_layout()
     plt.savefig(os.path.join(plot_dir, "08_full_pipeline_recovery.png"),
                 dpi=150, bbox_inches="tight")
@@ -675,8 +740,10 @@ def evaluate_full_pipeline(
     print(f"    Final answer exact match: {np.mean(answer_matches):.2%}")
     if HAS_SYMPY:
         print(f"    Final answer symbolic match: {np.mean(symbolic_matches):.2%}")
+        print(f"    Equation consistency: {np.mean(equation_consistencies):.2%}")
     else:
         print("    Final answer symbolic match: unavailable (sympy not installed)")
+        print("    Equation consistency: unavailable (sympy not installed)")
 
     # Print samples
     print("\n  ── Full Pipeline Samples (Honest) ──")
@@ -689,6 +756,7 @@ def evaluate_full_pipeline(
               f"Gen={r['generated_final_answer']!r} | "
               f"EM={bool(r['final_answer_exact_match'])} | "
               f"SYM={bool(r['final_answer_symbolic_match'])}")
+        print(f"    Equation consistency: {r['equation_consistency']:.0%}")
 
     # Save
     results_path = os.path.join(config.data_dir, "full_pipeline_results.json")

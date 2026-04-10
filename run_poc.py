@@ -25,6 +25,11 @@ import time
 import argparse
 import torch
 
+from checkpointing import (
+    build_decoder_from_checkpoint,
+    build_flow_from_checkpoint,
+    build_jepa_from_checkpoint,
+)
 from config import DLRConfig, production_config
 
 
@@ -84,7 +89,10 @@ def main():
         config.use_compile = False  # Compilation overhead > training time
         config.use_bf16 = False
         config.use_liger = False
+        config.full_pipeline_eval_samples = 10
         print("⚡ QUICK TEST MODE: minimal epochs and samples")
+
+    config.validate()
 
     # Print config
     # Build compute flags string
@@ -169,17 +177,8 @@ def main():
     if flow_model is None:
         flow_ckpt = os.path.join(config.checkpoint_dir, "flow_final.pt")
         if os.path.exists(flow_ckpt):
-            from modules.flow_expert import FlowExpert
             ckpt = torch.load(flow_ckpt, map_location=config.device, weights_only=False)
-            flow_model = FlowExpert(
-                d_model=config.d_model,
-                n_heads=config.n_heads,
-                n_layers=config.flow_layers,
-                n_waypoints=config.n_waypoints,
-            ).to(config.device)
-            incompatible = flow_model.load_state_dict(
-                ckpt["model_state_dict"], strict=False
-            )
+            flow_model, _, incompatible = build_flow_from_checkpoint(ckpt, config)
             if incompatible.missing_keys or incompatible.unexpected_keys:
                 print(
                     "⚠ Flow checkpoint is not fully compatible with the current "
@@ -190,38 +189,19 @@ def main():
     if decoder_model is None:
         dec_ckpt = os.path.join(config.checkpoint_dir, "decoder_final.pt")
         if os.path.exists(dec_ckpt):
-            from modules.decoder import ScribeDecoder
             from data_pipeline import prepare_tokenizer
             tokenizer = prepare_tokenizer()
             ckpt = torch.load(dec_ckpt, map_location=config.device, weights_only=False)
-            decoder_model = ScribeDecoder(
-                vocab_size=ckpt["vocab_size"],
-                d_model=config.d_model,
-                n_heads=config.n_heads,
-                n_layers=config.decoder_layers,
-                n_waypoints=config.n_waypoints,
-                window_half=config.decoder_window_half,
-            ).to(config.device)
-            decoder_model.load_state_dict(ckpt["model_state_dict"])
+            decoder_model, _ = build_decoder_from_checkpoint(ckpt, config)
 
     if jepa_model is None:
         jepa_ckpt = os.path.join(config.checkpoint_dir, "jepa_final.pt")
         if os.path.exists(jepa_ckpt):
-            from modules.text_jepa import TextJEPA
             from data_pipeline import prepare_tokenizer as _pt
             if tokenizer is None:
                 tokenizer = _pt()
             ckpt = torch.load(jepa_ckpt, map_location=config.device, weights_only=False)
-            jepa_model = TextJEPA(
-                vocab_size=ckpt["vocab_size"],
-                d_model=config.d_model,
-                n_heads=config.n_heads,
-                n_layers=config.encoder_layers,
-                predictor_hidden=config.predictor_hidden,
-                oracle_layers=config.oracle_layers,
-                oracle_expansion=config.oracle_expansion,
-            ).to(config.device)
-            jepa_model.load_state_dict(ckpt["model_state_dict"])
+            jepa_model, _ = build_jepa_from_checkpoint(ckpt, config)
 
     if parsed_problems is None:
         from data_pipeline import load_dataset_split, parse_all_problems

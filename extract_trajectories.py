@@ -23,6 +23,7 @@ import os
 import torch
 from tqdm import tqdm
 
+from checkpointing import build_jepa_from_checkpoint
 from config import DLRConfig
 from modules.text_jepa import TextJEPA
 from data_pipeline import (
@@ -30,6 +31,7 @@ from data_pipeline import (
     parse_all_problems,
     prepare_tokenizer,
     format_context,
+    trajectory_prefixes_fit_budget,
 )
 
 
@@ -52,32 +54,24 @@ def extract_trajectories(
     print("PHASE 1.5: Extracting Z_true Trajectories")
     print("=" * 60)
 
+    config.validate()
     device = config.device
     os.makedirs(config.data_dir, exist_ok=True)
 
     # ── Load model if not provided ──────────────────────────────
     if model is None:
         print("\n[1/3] Loading frozen JEPA from checkpoint...")
-        tokenizer = prepare_tokenizer()
         checkpoint = torch.load(
             os.path.join(config.checkpoint_dir, "jepa_final.pt"),
             map_location=device,
             weights_only=False,
         )
-        vocab_size = checkpoint["vocab_size"]
-        model = TextJEPA(
-            vocab_size=vocab_size,
-            d_model=config.d_model,
-            n_heads=config.n_heads,
-            n_layers=config.encoder_layers,
-            predictor_hidden=config.predictor_hidden,
-            dropout=0.0,  # No dropout during extraction
-            ff_mult=config.ff_mult,
-            max_len=config.max_seq_len,
-        ).to(device)
-        model.load_state_dict(checkpoint["model_state_dict"])
+        model, config = build_jepa_from_checkpoint(checkpoint, config)
     else:
         print("\n[1/3] Using provided JEPA model...")
+
+    if tokenizer is None:
+        tokenizer = prepare_tokenizer()
 
     # Freeze everything
     model.eval()
@@ -99,11 +93,16 @@ def extract_trajectories(
     all_active_masks = []
     all_z_targets = []
     problem_indices = []
+    skipped_for_length = 0
 
     for prob_idx, item in enumerate(tqdm(parsed_problems, desc="  Extracting")):
         problem = item["problem"]
         steps = item["steps"]
         n_steps = len(steps)
+
+        if not trajectory_prefixes_fit_budget(problem, steps, tokenizer, config.max_seq_len):
+            skipped_for_length += 1
+            continue
 
         # ── Encode each cumulative prefix ───────────────────────
         waypoints = []
@@ -157,12 +156,18 @@ def extract_trajectories(
         problem_indices.append(prob_idx)
 
     # ── Stack and save ──────────────────────────────────────────
+    if not all_Z_true:
+        raise RuntimeError(
+            "No trajectories could be extracted. Increase max_seq_len or reduce proof length."
+        )
+
     # V3: No prompt_kv — the trajectory IS the unified cache
     trajectories = {
-        "Z_true": torch.stack(all_Z_true),           # [P, N, d]
+        "Z_true": torch.stack(all_Z_true),              # [P, N, d]
         "active_masks": torch.stack(all_active_masks),  # [P, N]
-        "z_targets": torch.stack(all_z_targets),      # [P, d]
+        "z_targets": torch.stack(all_z_targets),        # [P, d]
         "problem_indices": problem_indices,
+        "skipped_for_length": skipped_for_length,
     }
 
     save_path = os.path.join(config.data_dir, "trajectories.pt")
@@ -170,6 +175,8 @@ def extract_trajectories(
 
     print(f"\n  ✓ Saved {len(all_Z_true)} trajectories to {save_path}")
     print(f"    Z_true shape: {trajectories['Z_true'].shape}")
+    if skipped_for_length:
+        print(f"    Skipped overlong proofs: {skipped_for_length}")
     print(f"    Active waypoints: "
           f"min={int(trajectories['active_masks'].sum(1).min())}, "
           f"max={int(trajectories['active_masks'].sum(1).max())}, "

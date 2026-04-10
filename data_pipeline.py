@@ -121,6 +121,36 @@ def format_full_solution(steps: List[str]) -> str:
     return " ".join(parts) + " [CONCLUSION]"
 
 
+def token_length(tokenizer, text: str) -> int:
+    """Count tokens without truncation so datasets can reject overlong examples."""
+    return len(tokenizer.encode(text))
+
+
+def fits_token_budget(tokenizer, text: str, max_seq_len: int) -> bool:
+    """True if a sequence fits inside the configured token budget."""
+    return token_length(tokenizer, text) <= max_seq_len
+
+
+def trajectory_prefixes_fit_budget(
+    problem: str,
+    steps: List[str],
+    tokenizer,
+    max_seq_len: int,
+) -> bool:
+    """
+    Check the full extraction path, not just the final proof.
+
+    Extraction encodes the premise and every cumulative prefix; any over-budget
+    prefix would otherwise be silently truncated and poison z_target.
+    """
+    if not fits_token_budget(tokenizer, format_premise(problem), max_seq_len):
+        return False
+    for upto in range(len(steps)):
+        if not fits_token_budget(tokenizer, format_context(problem, steps, upto), max_seq_len):
+            return False
+    return True
+
+
 def prepare_tokenizer(
     tokenizer_name: str = "bert-base-uncased",
     custom_path: str = "checkpoints/tokenizer",
@@ -212,9 +242,10 @@ class JEPADataset(Dataset):
                 # Guard: skip pairs where context would be truncated.
                 # Truncation silently chops the premise or recent steps,
                 # causing the JEPA to learn corrupted representations.
-                ctx_len = len(tokenizer.encode(context))
-                goal_len = len(tokenizer.encode(goal_state))
-                if ctx_len > max_seq_len or goal_len > max_seq_len:
+                if (
+                    not fits_token_budget(tokenizer, context, max_seq_len)
+                    or not fits_token_budget(tokenizer, goal_state, max_seq_len)
+                ):
                     skipped += 1
                     continue
 
@@ -331,11 +362,16 @@ class DecoderDataset(Dataset):
 
         # Tokenize solutions
         self.items = []
+        skipped = 0
         for i, prob_idx in enumerate(self.problem_indices):
             if prob_idx >= len(parsed_problems):
                 continue
             steps = parsed_problems[prob_idx]["steps"]
             solution_text = format_full_solution(steps)
+
+            if not fits_token_budget(tokenizer, solution_text, max_seq_len):
+                skipped += 1
+                continue
 
             tokens = tokenizer(
                 solution_text,
@@ -354,7 +390,11 @@ class DecoderDataset(Dataset):
                 }
             )
 
-        print(f"  DecoderDataset: {len(self.items)} trajectory→text pairs")
+        self.skipped_due_to_truncation = skipped
+        print(
+            f"  DecoderDataset: {len(self.items)} trajectory→text pairs "
+            f"({skipped} skipped due to truncation)"
+        )
 
     def __len__(self):
         return len(self.items)

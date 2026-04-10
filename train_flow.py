@@ -28,6 +28,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from config import DLRConfig
+from checkpointing import build_jepa_from_checkpoint, save_model_checkpoint
 from modules.flow_expert import FlowExpert, masked_mse_loss, stop_indices_from_active_mask
 from modules.energy_critic import EnergyCritic, energy_contrastive_loss, flow_energy_penalty
 from modules.text_jepa import TextJEPA
@@ -45,6 +46,7 @@ def train_flow(config: DLRConfig, jepa_model: TextJEPA = None) -> dict:
     print("PHASE 2: Training Flow Expert + Energy Critic")
     print("=" * 60)
 
+    config.validate()
     torch.manual_seed(config.seed)
     device = config.device
     config.apply_compute_optimizations()
@@ -92,19 +94,7 @@ def train_flow(config: DLRConfig, jepa_model: TextJEPA = None) -> dict:
             map_location=device,
             weights_only=False,
         )
-        jepa_model = TextJEPA(
-            vocab_size=jepa_ckpt["vocab_size"],
-            d_model=config.d_model,
-            n_heads=config.n_heads,
-            n_layers=config.encoder_layers,
-            predictor_hidden=config.predictor_hidden,
-            dropout=0.0,
-            ff_mult=config.ff_mult,
-            max_len=config.max_seq_len,
-            oracle_layers=config.oracle_layers,
-            oracle_expansion=config.oracle_expansion,
-        ).to(device)
-        jepa_model.load_state_dict(jepa_ckpt["model_state_dict"])
+        jepa_model, _ = build_jepa_from_checkpoint(jepa_ckpt, config)
     else:
         print("\n[3/4] Using provided JEPA Oracle...")
 
@@ -135,6 +125,8 @@ def train_flow(config: DLRConfig, jepa_model: TextJEPA = None) -> dict:
     print(f"  Noise std for negatives: {config.energy_noise_std}")
     print(f"  Stop loss weight = {config.stop_loss_weight}")
     print(f"  Oracle exposure rate = {config.oracle_exposure_rate:.0%}")
+    print(f"  Energy critic enabled = {config.use_energy_critic}")
+    print(f"  Stop prediction enabled = {config.use_stop_prediction}")
 
     history = {
         "loss": [], "epoch_loss": [],
@@ -182,14 +174,17 @@ def train_flow(config: DLRConfig, jepa_model: TextJEPA = None) -> dict:
             # ══════════════════════════════════════════════════
             # Step 1: Update Energy Critic (contrastive pairs)
             # ══════════════════════════════════════════════════
-            critic_loss = energy_contrastive_loss(
-                energy_critic, Z_true,
-                noise_std=config.energy_noise_std,
-                margin=config.energy_margin,
-            )
-            critic_optimizer.zero_grad()
-            critic_loss.backward()
-            critic_optimizer.step()
+            if config.use_energy_critic:
+                critic_loss = energy_contrastive_loss(
+                    energy_critic, Z_true,
+                    noise_std=config.energy_noise_std,
+                    margin=config.energy_margin,
+                )
+                critic_optimizer.zero_grad()
+                critic_loss.backward()
+                critic_optimizer.step()
+            else:
+                critic_loss = torch.zeros((), device=device)
 
             # ══════════════════════════════════════════════════
             # Step 2: Update Flow Expert (velocity + energy penalty)
@@ -211,19 +206,26 @@ def train_flow(config: DLRConfig, jepa_model: TextJEPA = None) -> dict:
             # Forward (BF16 autocast)
             with config.autocast_ctx:
                 v_pred = flow_model(x_t, t, z_0, z_cond)  # [B, N, d]
-                stop_logits = raw_flow.predict_stop(z_0, z_cond)
+                if config.use_stop_prediction:
+                    stop_logits = raw_flow.predict_stop(z_0, z_cond)
+                    stop_loss = F.cross_entropy(stop_logits, stop_targets)
+                    stop_acc = (
+                        stop_logits.argmax(dim=-1) == stop_targets
+                    ).float().mean()
+                else:
+                    stop_loss = torch.zeros((), device=device)
+                    stop_acc = torch.zeros((), device=device)
 
                 # Masked MSE loss (Velocity Zero-Out)
                 flow_mse = masked_mse_loss(v_pred, v_true, active_mask)
-                stop_loss = F.cross_entropy(stop_logits, stop_targets)
-                stop_acc = (
-                    stop_logits.argmax(dim=-1) == stop_targets
-                ).float().mean()
 
                 # Energy penalty: penalize high-energy predicted endpoints
-                e_penalty = flow_energy_penalty(
-                    raw_critic, x_t, v_pred, t
-                )
+                if config.use_energy_critic:
+                    e_penalty = flow_energy_penalty(
+                        raw_critic, x_t, v_pred, t
+                    )
+                else:
+                    e_penalty = torch.zeros((), device=device)
 
                 loss = (
                     flow_mse
@@ -268,24 +270,18 @@ def train_flow(config: DLRConfig, jepa_model: TextJEPA = None) -> dict:
 
     # Save (raw uncompiled models)
     flow_path = os.path.join(config.checkpoint_dir, "flow_final.pt")
-    torch.save(
-        {
-            "model_state_dict": raw_flow.state_dict(),
-            "config": {
-                "d_model": config.d_model,
-                "n_heads": config.n_heads,
-                "flow_layers": config.flow_layers,
-                "n_waypoints": config.n_waypoints,
-            },
-        },
+    save_model_checkpoint(
         flow_path,
+        raw_flow.state_dict(),
+        config,
     )
     print(f"\n  ✓ Flow Expert saved to {flow_path}")
 
     critic_path = os.path.join(config.checkpoint_dir, "energy_critic_final.pt")
-    torch.save(
-        {"model_state_dict": raw_critic.state_dict()},
+    save_model_checkpoint(
         critic_path,
+        raw_critic.state_dict(),
+        config,
     )
     print(f"  ✓ Energy Critic saved to {critic_path}")
 

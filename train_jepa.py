@@ -23,6 +23,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from config import DLRConfig
+from checkpointing import save_model_checkpoint
 from modules.text_jepa import TextJEPA
 from modules.vicreg import vicreg_loss
 from data_pipeline import (
@@ -45,6 +46,7 @@ def train_jepa(config: DLRConfig) -> dict:
     print("=" * 60)
 
     # ── Setup ───────────────────────────────────────────────────
+    config.validate()
     torch.manual_seed(config.seed)
     os.makedirs(config.checkpoint_dir, exist_ok=True)
     os.makedirs(config.data_dir, exist_ok=True)
@@ -225,20 +227,11 @@ def train_jepa(config: DLRConfig) -> dict:
 
     # Save (always save raw uncompiled model)
     checkpoint_path = os.path.join(config.checkpoint_dir, "jepa_final.pt")
-    torch.save(
-        {
-            "model_state_dict": raw_model.state_dict(),
-            "vocab_size": vocab_size,
-            "config": {
-                "d_model": config.d_model,
-                "n_heads": config.n_heads,
-                "encoder_layers": config.encoder_layers,
-                "predictor_hidden": config.predictor_hidden,
-                "oracle_layers": config.oracle_layers,
-                "oracle_expansion": config.oracle_expansion,
-            },
-        },
+    save_model_checkpoint(
         checkpoint_path,
+        raw_model.state_dict(),
+        config,
+        vocab_size=vocab_size,
     )
     print(f"\n  ✓ JEPA + Oracle saved to {checkpoint_path}")
 

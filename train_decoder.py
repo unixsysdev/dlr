@@ -26,6 +26,11 @@ except ImportError:
     HAS_LIGER = False
 
 from config import DLRConfig
+from checkpointing import (
+    build_flow_from_checkpoint,
+    build_jepa_from_checkpoint,
+    save_model_checkpoint,
+)
 from modules.decoder import ScribeDecoder
 from modules.flow_expert import FlowExpert
 from modules.text_jepa import TextJEPA
@@ -53,19 +58,7 @@ def _load_frozen_generation_models(
             map_location=device,
             weights_only=False,
         )
-        jepa_model = TextJEPA(
-            vocab_size=ckpt["vocab_size"],
-            d_model=config.d_model,
-            n_heads=config.n_heads,
-            n_layers=config.encoder_layers,
-            predictor_hidden=config.predictor_hidden,
-            dropout=0.0,
-            ff_mult=config.ff_mult,
-            max_len=config.max_seq_len,
-            oracle_layers=config.oracle_layers,
-            oracle_expansion=config.oracle_expansion,
-        ).to(device)
-        jepa_model.load_state_dict(ckpt["model_state_dict"])
+        jepa_model, _ = build_jepa_from_checkpoint(ckpt, config)
 
     if flow_model is None:
         print("  Loading frozen Flow Expert for decoder trajectory generation...")
@@ -74,17 +67,7 @@ def _load_frozen_generation_models(
             map_location=device,
             weights_only=False,
         )
-        flow_model = FlowExpert(
-            d_model=config.d_model,
-            n_heads=config.n_heads,
-            n_layers=config.flow_layers,
-            n_waypoints=config.n_waypoints,
-            ff_mult=config.ff_mult,
-            dropout=0.0,
-        ).to(device)
-        incompatible = flow_model.load_state_dict(
-            ckpt["model_state_dict"], strict=False
-        )
+        flow_model, _, incompatible = build_flow_from_checkpoint(ckpt, config)
         if incompatible.missing_keys or incompatible.unexpected_keys:
             print(
                 "  ⚠ Flow checkpoint missing keys for current architecture: "
@@ -132,6 +115,7 @@ def train_decoder(
     print("PHASE 3: Training the Scribe Decoder")
     print("=" * 60)
 
+    config.validate()
     torch.manual_seed(config.seed)
     device = config.device
     config.apply_compute_optimizations()
@@ -177,6 +161,7 @@ def train_decoder(
         n_layers=config.decoder_layers,
         n_waypoints=config.n_waypoints,
         window_half=config.decoder_window_half,
+        use_sliding_window=config.use_sliding_window,
         max_seq_len=config.decoder_max_seq_len,
         ff_mult=config.ff_mult,
         dropout=config.dropout,
@@ -352,19 +337,11 @@ def train_decoder(
 
     # Save (raw uncompiled model)
     checkpoint_path = os.path.join(config.checkpoint_dir, "decoder_final.pt")
-    torch.save(
-        {
-            "model_state_dict": raw_model.state_dict(),
-            "vocab_size": vocab_size,
-            "config": {
-                "d_model": config.d_model,
-                "n_heads": config.n_heads,
-                "decoder_layers": config.decoder_layers,
-                "n_waypoints": config.n_waypoints,
-                "decoder_window_half": config.decoder_window_half,
-            },
-        },
+    save_model_checkpoint(
         checkpoint_path,
+        raw_model.state_dict(),
+        config,
+        vocab_size=vocab_size,
     )
     print(f"\n  ✓ Decoder saved to {checkpoint_path}")
 

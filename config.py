@@ -8,7 +8,7 @@ Supports two profiles:
 
 import math
 import torch
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, fields
 
 
 @dataclass
@@ -20,7 +20,7 @@ class DLRConfig:
     predictor_hidden: int = 64   # Predictor bottleneck dim
     flow_layers: int = 4         # Flow Expert (DiT) depth
     decoder_layers: int = 2      # Scribe decoder depth
-    n_waypoints: int = 16        # Max trajectory waypoints N
+    n_waypoints: int = 21        # Max trajectory waypoints N (must cover premise + max_steps)
     ff_mult: int = 4             # FFN expansion factor
     dropout: float = 0.1
 
@@ -53,6 +53,7 @@ class DLRConfig:
     decoder_weight_decay: float = 0.01
     decoder_max_seq_len: int = 256  # Decoder output max tokens
     decoder_window_half: int = 2    # Sliding window half-width
+    use_sliding_window: bool = True  # False = unconstrained cross-attention ablation
     use_gt_trajectories: bool = True  # False = generated trajectories only
     decoder_generated_mix_start: float = 0.0  # Fraction of generated trajs at epoch 0
     decoder_generated_mix_end: float = 0.5    # Fraction of generated trajs at final epoch
@@ -73,14 +74,17 @@ class DLRConfig:
     energy_hidden: int = 256          # Critic hidden dim
     energy_margin: float = 1.0        # Contrastive margin
     energy_noise_std: float = 0.5     # Std for negative samples
+    use_energy_critic: bool = True    # False = disable critic update + penalty
     energy_penalty_weight: float = 0.1  # α in flow loss
     energy_lr: float = 1e-4           # Critic learning rate
+    use_stop_prediction: bool = True  # False = disable stop-head supervision
     stop_loss_weight: float = 0.2     # Weight for trajectory stop prediction
 
     # ── ODE Solver ──────────────────────────────────────────────────
     ode_steps: int = 50          # Euler integration steps
     ode_solver: str = "heun"     # 'euler' (fast) or 'heun' (accurate)
     eval_temperature: float = 0.0  # 0.0 = strict greedy decoding for eval
+    full_pipeline_eval_samples: int = 100  # Held-out samples for honest end-to-end eval
 
     # ── Compute Optimization ────────────────────────────────────────
     use_compile: bool = True     # torch.compile (graph compilation)
@@ -98,6 +102,37 @@ class DLRConfig:
     data_dir: str = "data"
     plot_dir: str = "plots"
     grad_clip: float = 1.0       # Gradient clipping norm
+
+    def validate(self):
+        """Fail fast on config combinations that silently corrupt training targets."""
+        min_waypoints = self.max_steps + 1  # premise + each proof step
+        if self.n_waypoints < min_waypoints:
+            raise ValueError(
+                f"n_waypoints={self.n_waypoints} is too small for max_steps={self.max_steps}. "
+                f"Need at least {min_waypoints} waypoints to preserve the final proof state."
+            )
+        if self.max_seq_len <= 0 or self.decoder_max_seq_len <= 0:
+            raise ValueError("Sequence lengths must be positive.")
+        if self.full_pipeline_eval_samples <= 0:
+            raise ValueError("full_pipeline_eval_samples must be positive.")
+        if not 0.0 <= self.oracle_exposure_rate <= 1.0:
+            raise ValueError("oracle_exposure_rate must be in [0, 1].")
+        if not 0.0 <= self.decoder_generated_mix_start <= 1.0:
+            raise ValueError("decoder_generated_mix_start must be in [0, 1].")
+        if not 0.0 <= self.decoder_generated_mix_end <= 1.0:
+            raise ValueError("decoder_generated_mix_end must be in [0, 1].")
+
+    def to_dict(self) -> dict:
+        """Serialize the full runtime config into checkpoint-friendly primitives."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict, base: "DLRConfig" = None) -> "DLRConfig":
+        """Hydrate a config from a checkpoint, optionally overlaying a base config."""
+        valid_fields = {f.name for f in fields(cls)}
+        payload = base.to_dict() if base is not None else {}
+        payload.update({k: v for k, v in data.items() if k in valid_fields})
+        return cls(**payload)
 
     def ema_schedule(self, step: int, total_steps: int) -> float:
         """Cosine EMA momentum schedule: 0.996 → 1.0"""
@@ -212,5 +247,6 @@ def production_config() -> DLRConfig:
         pin_memory=True,
 
         # General
+        full_pipeline_eval_samples=500,
         grad_clip=1.0,
     )

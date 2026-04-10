@@ -14,7 +14,7 @@ The architecture consists of:
 2. A **Rectified Flow Expert** (DiT backbone) guided by an **Energy Critic** that generates optimal-transport trajectories between the premise and the predicted goal state through deterministic ODE integration.
 3. A **Scribe Decoder** that translates the continuous trajectory into discrete mathematical text via sliding-window cross-attention.
 
-This repository provides a complete, GPU-validated Proof-of-Concept implementation, including a custom math-native tokenizer, configurable compute optimizations (torch.compile, BF16, Liger kernels), and a strict end-to-end evaluation dashboard. The architecture is designed for validation on a single high-memory GPU (H200/B200) within 24 hours.
+This repository provides a GPU-validated Proof-of-Concept implementation with configurable compute optimizations (`torch.compile`, BF16, Liger kernels), explicit truncation guards on extracted trajectories and decoder targets, and an end-to-end evaluation dashboard. A custom math tokenizer is supported and recommended; if it is absent, the pipeline falls back to a general-purpose tokenizer with DLR special tokens added.
 
 ---
 
@@ -30,7 +30,7 @@ DLR replicates this workflow:
 - The **Flow Expert** acts as a latent planner, learning a conditioned transport path between the premise and the predicted goal state using Rectified Flow.
 - The **Decoder** reads this pre-computed trajectory and transcribes it into text.
 
-The critical insight is that **reasoning happens in continuous space, not in token space**. Token generation is a post-hoc decoding step, not a cognitive one.
+The working hypothesis is that structured mathematical proofs admit a useful continuous intermediate representation, and that planning in that space can be easier to supervise than direct token-level rollout. Token generation is treated as a downstream transcription problem rather than the sole locus of reasoning.
 
 ---
 
@@ -102,15 +102,15 @@ A lightweight causal decoder that translates the $N \times d$ continuous traject
 
 **Unified Trajectory Cache (No Double-Dip):** The JEPA's cumulative encoding compresses the full problem context into $z_0 = E_y(\text{[PREMISE]})$. The Flow Expert receives $z_0$ via AdaLN, eliminating the need for a massive token-level KV cache. Memory reduction: from $[S \times d] + [N \times d]$ to $[N \times d]$ only.
 
-**Custom Math-Native Tokenizer:** A BPE tokenizer trained directly on the mathematical reasoning corpus. Numbers remain intact as single tokens (e.g., `256`), and structural tokens (`[PREMISE]`, `[STEP]`) are native entries.
+**Custom Math-Native Tokenizer:** A BPE tokenizer can be trained directly on the mathematical reasoning corpus. The pre-tokenizer is designed to preserve many numbers as contiguous units and to make structural tokens (`[PREMISE]`, `[STEP]`) native entries, but this is an empirical tokenizer choice, not a formal guarantee.
 
-**Train/Test Hygiene:** Explicit 90/10 data split. Metric D remains a train-split diagnostic on extracted `Z_true`, while Metric E encodes held-out test premises on the fly and never loads `trajectories.pt`. Phase 3 now trains the decoder on a scheduled mix of extracted and generated trajectories instead of clean `Z_true` alone.
+**Train/Test Hygiene:** Explicit 90/10 data split. Metric D remains a train-split diagnostic on extracted `Z_true`, while Metric E encodes held-out test premises on the fly and never loads `trajectories.pt`. Phase 3 trains the decoder on a scheduled mix of extracted and generated trajectories instead of clean `Z_true` alone, and overlong decoder targets are now rejected rather than silently truncated.
 
 ---
 
 ## Evaluation Protocol
 
-Five strict metrics designed to isolate each stage of the information pipeline. Metric D is a train-split decoder diagnostic on `Z_true`; Metric E is the held-out honest test and encodes premises on the fly.
+Five strict metrics designed to isolate each stage of the information pipeline. Metric D is a train-split decoder diagnostic on `Z_true`; Metric E is the held-out honest test and encodes premises on the fly over a configurable held-out sample budget.
 
 | Metric | What It Measures | Success Criterion |
 |---|---|---|
@@ -118,7 +118,7 @@ Five strict metrics designed to isolate each stage of the information pipeline. 
 | **B. Oracle Accuracy** | $\| \hat{z}_{final} - z_{goal} \|$ (full cumulative endpoint) | Oracle maps premise to the same latent sink used by the flow model |
 | **C. Flow Trajectory Validity** | $\mathcal{E}(Z_{generated})$ + hard boundary check | Generated trajectories start at $z_0$ and maintain low energy |
 | **D. Token Recovery (diagnostic)** | Exact match of numbers/operators decoded from extracted `Z_true` | Decoder can read latent trajectories at all |
-| **E. Honest Full Pipeline** | Held-out premise → JEPA → Oracle → Flow → Decoder, plus final-answer exact match and symbolic equivalence when parseable | Non-zero held-out recovery without trajectory leakage |
+| **E. Honest Full Pipeline** | Held-out premise → JEPA → Oracle → Flow → Decoder, plus final-answer exact match, symbolic equivalence, and equation-consistency checks when parseable | Non-zero held-out recovery without trajectory leakage |
 
 ---
 

@@ -101,6 +101,7 @@ class ScribeDecoder(nn.Module):
         n_layers: int = 2,
         n_waypoints: int = 16,
         window_half: int = 2,
+        use_sliding_window: bool = True,
         max_seq_len: int = 256,
         ff_mult: int = 4,
         dropout: float = 0.1,
@@ -109,6 +110,7 @@ class ScribeDecoder(nn.Module):
         self.d_model = d_model
         self.n_waypoints = n_waypoints
         self.window_half = window_half
+        self.use_sliding_window = use_sliding_window
         self.max_seq_len = max_seq_len
 
         # Token embedding + positional encoding
@@ -152,6 +154,8 @@ class ScribeDecoder(nn.Module):
             [L, N] float mask: 0=attend, -inf=block
         """
         N = self.n_waypoints
+        if not self.use_sliding_window:
+            return torch.zeros((seq_len, N), device=device)
         w = self.window_half
         mask = torch.full((seq_len, N), float("-inf"), device=device)
         for i in range(seq_len):
