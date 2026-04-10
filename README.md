@@ -86,26 +86,34 @@ A lightweight causal decoder that translates the $N \times d$ continuous traject
 
 ## Key Design Decisions
 
-**Autonomous Goal Formulation:** By forcing the system to predict its own endpoint ($\hat{z}_{final}$) before reasoning begins, we align the architecture with genuine problem-solving rather than supervised interpolation.
+**Autonomous Goal Formulation:** By forcing the system to predict its own endpoint ($\hat{z}_{final}$) before reasoning begins — trained against the actual *conclusion* of each proof, not an intermediate step — we align the architecture with genuine problem-solving rather than supervised interpolation.
 
 **VICReg Anti-Collapse:** Replacing simple L2 variance monitors with explicit Variance and Covariance penalties ensures that the "Geometry of Not Being Wrong" maintains a rigid, high-fidelity topology where distance equates to logical divergence.
+
+**Attention-Weighted Pooling:** A learned query vector computes position-aware attention scores over all token embeddings, producing a structure-sensitive representation. Unlike mean pooling, this distinguishes operand ordering (e.g., `2x = 4` vs. `4x = 2`).
+
+**Hard Boundary Enforcement:** The generated trajectory is physically clamped: $x_0 = z_0$ after every ODE integration step. Boundary conditions are enforced as hard physics, not soft AdaLN suggestions.
+
+**Spectral Normalization (Energy Critic):** All linear layers in the Energy Critic use spectral normalization to guarantee Lipschitz stability and prevent energy explosion. Gradients flow through the velocity field into the Flow Expert — the penalty is not decorative.
 
 **Unified Trajectory Cache (No Double-Dip):** The JEPA's cumulative encoding compresses the full problem context into $z_0 = E_y(\text{[PREMISE]})$. The Flow Expert receives $z_0$ via AdaLN, eliminating the need for a massive token-level KV cache. Memory reduction: from $[S \times d] + [N \times d]$ to $[N \times d]$ only.
 
 **Custom Math-Native Tokenizer:** A BPE tokenizer trained directly on the mathematical reasoning corpus. Numbers remain intact as single tokens (e.g., `256`), and structural tokens (`[PREMISE]`, `[STEP]`) are native entries.
 
+**Train/Test Hygiene:** Explicit 90/10 data split. All evaluation metrics (including Metric E) run exclusively on held-out test problems. No training data contaminates the evaluation dashboard.
+
 ---
 
 ## Evaluation Protocol
 
-Four strict metrics designed to isolate each stage of the information pipeline, with zero oracle leakage at inference:
+Four strict metrics designed to isolate each stage of the information pipeline, with zero oracle leakage at inference. All evaluation runs on a **held-out test split** (10% of the dataset, disjoint from training).
 
 | Metric | What It Measures | Success Criterion |
 |---|---|---|
 | **A. VICReg Stability** | Variance and Covariance losses over training | Rapid stabilization without dimensional collapse |
-| **B. Oracle Accuracy** | $\| \hat{z}_{final} - z_{true\_final} \|$ | Oracle successfully maps premise to valid proof sink |
-| **C. Flow Trajectory Validity** | $\mathcal{E}(Z_{generated})$ | Generated trajectories maintain low energy (valid logic) |
-| **D. End-to-End Recovery** | Exact match of numbers/operators decoded from generated flows | Above baseline (>10% at PoC scale) |
+| **B. Oracle Accuracy** | $\| \hat{z}_{final} - z_{conclusion} \|$ (true conclusion, not step k+1) | Oracle maps premise to valid proof sink |
+| **C. Flow Trajectory Validity** | $\mathcal{E}(Z_{generated})$ + hard boundary check | Generated trajectories start at $z_0$ and maintain low energy |
+| **D. End-to-End Recovery** | Exact match of numbers/operators decoded from generated flows | Above baseline (>10% at PoC scale) on held-out data |
 
 ---
 

@@ -15,7 +15,7 @@ python train_tokenizer.py --vocab-size 8192 --n-samples 5000
 # 4. Validate data pipeline (~1 min)
 python test_data_pipeline.py --n-samples 500
 
-# 5. Fire the production run (all V4 modules active)
+# 5. Fire the production run (all V5 modules active)
 nohup python run_poc.py --production > dlr_run.log 2>&1 &
 echo $! > dlr.pid
 
@@ -28,15 +28,18 @@ tail -f dlr_run.log
 | Parameter | Value |
 |---|---|
 | d_model | 1024 |
+| max_seq_len | 1024 |
 | n_waypoints | 32 |
-| n_samples | 100,000 |
+| n_samples | 100,000 (90/10 train/test split) |
 | Encoder layers | 8 |
 | Flow layers | 12 |
 | Decoder layers | 4 |
 | Oracle layers | 6 |
+| Pooling | Attention-weighted (learned query) |
 | Batch sizes | 256/128/128 |
-| ODE solver | Heun (2nd order) |
+| ODE solver | Heun (2nd order) + hard boundary |
 | VICReg | λ_inv=25, λ_var=25, λ_cov=1 |
+| Energy Critic | Spectral norm + gradient-preserving penalty |
 | Energy penalty α | 0.1 |
 | Compute | compile + bf16 + tf32 + liger |
 
@@ -132,14 +135,14 @@ plots/
 
 ## The Honest Test (Metric E)
 
-The primary pass/fail is `08_full_pipeline_recovery.png`. This runs:
+The primary pass/fail is `08_full_pipeline_recovery.png`. This runs **on held-out test data only** (10% of the dataset, never seen during training):
 
 ```
-premise → JEPA.encode → z_0
-z_0 → Oracle.predict_goal → ẑ_final
-noise → Flow.generate(z_0, ẑ_final, heun) → Z_gen
+premise → JEPA.encode (attn-pool) → z_0
+z_0 → Oracle.predict_goal → ĉ_final
+noise → Flow.generate(z_0, ĉ_final, heun, hard_boundary) → Z_gen
 Z_gen → Decoder.generate → text
 text vs. ground_truth → recovery rate
 ```
 
-**No ground-truth leakage at any stage.** If recovery rate is >10%, the continuous reasoning pipeline works.
+**No ground-truth leakage at any stage. No training data contamination.** If recovery rate is >10% on the held-out set, the continuous reasoning pipeline generalizes.
