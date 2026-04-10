@@ -15,7 +15,7 @@ python train_tokenizer.py --vocab-size 8192 --n-samples 5000
 # 4. Validate data pipeline (~1 min)
 python test_data_pipeline.py --n-samples 500
 
-# 5. Fire the production run (Heun solver, all compute opts ON)
+# 5. Fire the production run (all V4 modules active)
 nohup python run_poc.py --production > dlr_run.log 2>&1 &
 echo $! > dlr.pid
 
@@ -33,18 +33,22 @@ tail -f dlr_run.log
 | Encoder layers | 8 |
 | Flow layers | 12 |
 | Decoder layers | 4 |
+| Oracle layers | 6 |
 | Batch sizes | 256/128/128 |
 | ODE solver | Heun (2nd order) |
+| VICReg | λ_inv=25, λ_var=25, λ_cov=1 |
+| Energy penalty α | 0.1 |
 | Compute | compile + bf16 + tf32 + liger |
 
 ## Expected Timeline (~14-18h)
 
 ```
-Phase 1   (JEPA):      ~4-6h    → checkpoints/jepa_final.pt
-Phase 1.5 (Extract):   ~30min   → data/trajectories.pt
-Phase 2   (Flow):      ~6-8h    → checkpoints/flow_final.pt
-Phase 3   (Decoder):   ~2-3h    → checkpoints/decoder_final.pt
-Eval:                  ~30min   → plots/*.png
+Phase 1   (JEPA+Oracle+VICReg):  ~4-6h  → checkpoints/jepa_final.pt
+Phase 1.5 (Extract):             ~30min → data/trajectories.pt
+Phase 2   (Flow+Energy Critic):  ~6-8h  → checkpoints/flow_final.pt
+                                         → checkpoints/energy_critic_final.pt
+Phase 3   (Decoder):             ~2-3h  → checkpoints/decoder_final.pt
+Eval:                            ~30min → plots/*.png
 ```
 
 ## Monitoring Checkpoints
@@ -56,12 +60,28 @@ nvidia-smi -l 5
 # Check what phase we're on
 grep "PHASE\|Epoch\|✓\|⚠" dlr_run.log | tail -20
 
-# Check for JEPA collapse (CRITICAL — if this happens, kill and adjust)
-grep "COLLAPSE\|z_var" dlr_run.log | tail -5
+# Phase 1: VICReg sub-losses (inv should decrease, var should stabilize near 0)
+grep "inv=\|var=\|ora=" dlr_run.log | tail -10
+
+# Phase 2: Flow + Energy penalty
+grep "flow=\|e_pen=\|crit=" dlr_run.log | tail -10
+
+# Check z_var (VICReg should keep this healthy automatically)
+grep "z_v=" dlr_run.log | tail -5
 
 # Check flow loss trend
-grep "Flow.*Loss" dlr_run.log | tail -10
+grep "Flow.*Loss\|Epoch.*Loss" dlr_run.log | tail -10
 ```
+
+## What to Watch For
+
+| Signal | Meaning | Action |
+|---|---|---|
+| `var_loss > 1.0` sustained | VICReg variance not kicking in | Increase `vicreg_lambda_var` |
+| `oracle_loss` not decreasing | Oracle can't predict conclusions | Increase `oracle_layers` (try 6→8) |
+| `e_pen` near 0 from start | Energy Critic too weak | Increase `energy_noise_std` |
+| `crit_loss` near 0 | Critic perfectly separates (good) | Normal — means negatives are easy |
+| `flow_loss` stalls > 1.0 | Flow can't learn velocity | Check trajectory quality, try more JEPA epochs |
 
 ## If Something Breaks
 
@@ -86,23 +106,40 @@ python run_poc.py --production --no-bf16
 
 ```
 checkpoints/
-  tokenizer/          # Custom math BPE (8K vocab)
-  jepa_final.pt       # Frozen JEPA for trajectory extraction
-  flow_final.pt       # Trained Flow Expert
-  decoder_final.pt    # Trained Scribe Decoder
+  tokenizer/              # Custom math BPE (8K vocab)
+  jepa_final.pt           # Frozen JEPA + Oracle
+  flow_final.pt           # Trained Flow Expert
+  energy_critic_final.pt  # Trained Energy Critic
+  decoder_final.pt        # Trained Scribe Decoder
 
 data/
-  trajectories.pt     # Extracted Z_true [P, 32, 1024]
-  jepa_history.json   # Phase 1 metrics
-  flow_history.json   # Phase 2 metrics
-  decoder_history.json # Phase 3 metrics
+  trajectories.pt         # Extracted Z_true [P, 32, 1024]
+  jepa_history.json       # Phase 1 metrics (VICReg + Oracle losses)
+  flow_history.json       # Phase 2 metrics (flow + energy + critic)
+  decoder_history.json    # Phase 3 metrics
+  full_pipeline_results.json  # Metric E honest eval results
 
 plots/
-  01_jepa_training.png       # Loss + z_var + EMA schedule
-  02_cosine_monotonicity.png # Do trajectories progress logically?
-  03_trajectory_visualization.png  # UMAP/t-SNE of latent paths
-  04_flow_training.png       # Flow MSE loss curve
-  05_flow_endpoint.png       # Can the flow land at z_final?
-  06_token_recovery.png      # Can the decoder recover math tokens?
-  07_decoder_training.png    # CE loss + perplexity
+  01_jepa_training.png              # VICReg sub-losses + z_var + EMA schedule
+  02_cosine_monotonicity.png        # Do trajectories progress logically?
+  03_trajectory_visualization.png   # UMAP/t-SNE of latent paths
+  04_flow_training.png              # Flow MSE + energy penalty curves
+  05_flow_endpoint.png              # Can the flow land at z_final?
+  06_token_recovery.png             # Metric D: decoder on Z_true (diagnostic)
+  07_decoder_training.png           # CE loss + perplexity
+  08_full_pipeline_recovery.png     # Metric E: HONEST test (Oracle→Flow→Decoder)
 ```
+
+## The Honest Test (Metric E)
+
+The primary pass/fail is `08_full_pipeline_recovery.png`. This runs:
+
+```
+premise → JEPA.encode → z_0
+z_0 → Oracle.predict_goal → ẑ_final
+noise → Flow.generate(z_0, ẑ_final, heun) → Z_gen
+Z_gen → Decoder.generate → text
+text vs. ground_truth → recovery rate
+```
+
+**No ground-truth leakage at any stage.** If recovery rate is >10%, the continuous reasoning pipeline works.

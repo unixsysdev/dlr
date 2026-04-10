@@ -1,16 +1,195 @@
-Decoupled Latent Reasoner (DLR)Continuous-Space Mathematical Reasoning via Rectified Flow Over Learned Geometric TrajectoriesAbstractWe present the Decoupled Latent Reasoner (DLR), a three-module architecture that decouples mathematical reasoning from token generation by performing inference in continuous latent space. Rather than predicting the next token autoregressively—where each step compounds hallucination risk—DLR first constructs a complete geometric reasoning trajectory through a learned latent manifold, then recovers discrete text only at the final stage.The architecture consists of:A Text-JEPA (Joint Embedding Predictive Architecture) regularized via VICReg that learns the latent geometry of logical transitions, paired with an Oracle Predictor that hypothesizes the final proof state directly from the premise.A Rectified Flow Expert (DiT backbone) guided by an Energy Critic that generates optimal-transport trajectories between the premise and the predicted conclusion through deterministic ODE integration.A Scribe Decoder that translates the continuous trajectory into discrete mathematical text via sliding-window cross-attention.This repository provides a complete, GPU-validated Proof-of-Concept implementation, including a custom math-native tokenizer, configurable compute optimizations (torch.compile, BF16, Liger kernels), and a strict end-to-end evaluation dashboard. The architecture is designed for validation on a single high-memory GPU (H200/B200) within 24 hours.MotivationAutoregressive language models generate mathematical proofs one token at a time. This creates a fundamental architectural limitation: each token prediction is conditioned only on previous tokens, with no mechanism to plan ahead or verify the logical coherence of the full argument before committing to it.Consider how a human mathematician works. They first grasp the problem structure, visualize the geometric path from premise to conclusion, and only then write the steps. The writing is a transcription of an already-completed reasoning process—not the reasoning itself.DLR replicates this workflow:The Text-JEPA learns to represent reasoning states as points in a continuous $d$-dimensional manifold, capturing the logical "momentum" of a proof.The Flow Expert acts as a logic physics engine, computing the shortest geometrically valid path between the premise and the conclusion using Rectified Flow.The Decoder reads this pre-computed trajectory and transcribes it into text.The critical insight is that reasoning happens in continuous space, not in token space. Token generation is a post-hoc decoding step, not a cognitive one.ArchitectureModule A: Text-JEPA & The Oracle (Semantic Anchor)A 1D-sequence adaptation of I-JEPA for structured mathematical reasoning, heavily modified to prevent dimensional collapse and eliminate target leakage.The Oracle Predictor: To prevent the model from "cheating" by peeking at the ground-truth conclusion, an Oracle network predicts the final proof state ($\hat{z}_{final}$) strictly from the premise ($z_0$).$$\mathcal{L}_{Oracle} = \| \hat{z}_{final} - \text{sg}(z_{final}) \|^2_2$$VICReg Objective: The JEPA is trained using Variance-Invariance-Covariance Regularization to ensure the latent space remains expansive and structurally meaningful.$$\mathcal{L}_{JEPA} = \lambda \mathcal{L}_{inv} + \mu \mathcal{L}_{var} + \nu \mathcal{L}_{cov}$$ComponentRoleGradientContext Encoder $E_x$Encodes premise + previous steps✓ TrainableTarget Encoder $E_y$Encodes the ground-truth next step (via EMA)✗ Frozen (EMA)Oracle Predictor $P_{macro}$Deep MLP predicting $\hat{z}_{final}$ from $z_0$✓ TrainableStep Predictor $P_{micro}$Narrow MLP with learned "next-step" embedding✓ TrainableModule B: Rectified Flow Expert (Logic Engine)A DiT-based (Diffusion Transformer) model that generates continuous reasoning trajectories from noise via Rectified Flow. Crucially, the model is conditioned on the predicted endpoint ($\hat{z}_{final}$), forcing it to autonomously bridge the gap without ground-truth leakage.Rectified Flow Formulation:$$x_t = t \cdot Z_{true} + (1-t) \cdot \epsilon, \quad \epsilon \sim \mathcal{N}(0, I)$$$$v_{true} = Z_{true} - \epsilon$$The Energy Critic: To ensure trajectories do not drift through mathematically invalid latent space, the loss incorporates an Energy Function $\mathcal{E}(x_t)$ that penalizes representations of logical contradictions.$$\mathcal{L}_{flow} = \mathbb{E}_{t, \varepsilon} \left[ \| v_\theta(x_t, t, z_0, \hat{z}_{final}) - v_{true} \|^2 \cdot \mathbf{m} + \alpha \mathcal{E}(x_t) \right]$$Unified Trajectory Architecture: The Flow Expert receives the premise and predicted goal via Adaptive Layer Normalization (AdaLN).$$\text{cond} = \text{MLP}([z_0 \mid \hat{z}_{final} \mid \phi(t)])$$Module C: Scribe Decoder (Y-Decoder)A lightweight causal decoder that translates the $N \times d$ continuous trajectory into discrete text tokens via sliding-window cross-attention.Sliding Window Constraint: Token $i$ attends only to trajectory waypoints $[k-w, k+w]$ where $k = \lfloor i \cdot N/L \rfloor$. This prevents attention smearing and enforces local trajectory-to-token alignment.Weight Tying: The input embedding matrix and lm_head output projection share weights, halving parameter count on the vocabulary dimension.End-to-End Transcription: At inference, the decoder reads purely generated trajectories, acting as a true test of the Flow Expert's reasoning validity.Key Design DecisionsAutonomous Goal Formulation: By forcing the system to predict its own endpoint ($\hat{z}_{final}$) before reasoning begins, we align the architecture with genuine problem-solving rather than supervised interpolation.VICReg Anti-Collapse: Replacing simple L2 variance monitors with explicit Variance and Covariance penalties ensures that the "Geometry of Not Being Wrong" maintains a rigid, high-fidelity topology where distance equates to logical divergence.Unified Trajectory Cache (No Double-Dip): The JEPA's cumulative encoding compresses the full problem context into $z_0 = E_y(\text{[PREMISE]})$. The Flow Expert receives $z_0$ via AdaLN, eliminating the need for a massive token-level KV cache. Memory reduction: from $[S \times d] + [N \times d]$ to $[N \times d]$ only.Custom Math-Native Tokenizer: A BPE tokenizer trained directly on the mathematical reasoning corpus. Numbers remain intact as single tokens (e.g., 256), and structural tokens ([PREMISE], [STEP]) are native entries.Evaluation ProtocolFour strict metrics designed to isolate each stage of the information pipeline, with zero oracle leakage at inference:MetricWhat It MeasuresSuccess CriterionA. VICReg StabilityVariance and Covariance losses over trainingRapid stabilization without dimensional collapseB. Oracle Accuracy$\| \hat{z}_{final} - z_{true\_final} \|$Oracle successfully maps premise to valid proof sinkC. Flow Trajectory Validity$\mathcal{E}(Z_{generated})$Generated trajectories maintain low energy (valid logic)D. End-to-End RecoveryExact match of numbers/operators decoded from generated flowsAbove baseline (>10% at PoC scale)Compute OptimizationThe implementation employs a layered optimization strategy:LayerMechanismEffectGraph Compilationtorch.compileOperator fusion, 1.3-2× throughputMixed PrecisionBF16 autocast (forward) + FP32 (EMA)2× memory reduction, 2× throughputMatrix PrecisionTF32 matmul on Ampere+Free 2-3× speedup on matmulsFused KernelsLiger fused cross-entropy (decoder)Avoids materializing $[B \cdot L, V]$ logitsSafety invariant: EMA updates always execute in FP32 on the uncompiled model to prevent silent corruption of the target encoder geometry.Repository StructurePlaintextdlr/
+# Decoupled Latent Reasoner (DLR)
+
+**Continuous-Space Mathematical Reasoning via Rectified Flow Over Learned Geometric Trajectories**
+
+---
+
+## Abstract
+
+We present the **Decoupled Latent Reasoner** (DLR), a three-module architecture that decouples mathematical reasoning from token generation by performing inference in continuous latent space. Rather than predicting the next token autoregressively — where each step compounds hallucination risk — DLR first constructs a complete geometric reasoning trajectory through a learned latent manifold, then recovers discrete text only at the final stage.
+
+The architecture consists of:
+
+1. A **Text-JEPA** (Joint Embedding Predictive Architecture) regularized via **VICReg** that learns the latent geometry of logical transitions, paired with an **Oracle Predictor** that hypothesizes the final proof state directly from the premise.
+2. A **Rectified Flow Expert** (DiT backbone) guided by an **Energy Critic** that generates optimal-transport trajectories between the premise and the predicted conclusion through deterministic ODE integration.
+3. A **Scribe Decoder** that translates the continuous trajectory into discrete mathematical text via sliding-window cross-attention.
+
+This repository provides a complete, GPU-validated Proof-of-Concept implementation, including a custom math-native tokenizer, configurable compute optimizations (torch.compile, BF16, Liger kernels), and a strict end-to-end evaluation dashboard. The architecture is designed for validation on a single high-memory GPU (H200/B200) within 24 hours.
+
+---
+
+## Motivation
+
+Autoregressive language models generate mathematical proofs one token at a time. This creates a fundamental architectural limitation: each token prediction is conditioned only on previous tokens, with no mechanism to plan ahead or verify the logical coherence of the full argument before committing to it.
+
+Consider how a human mathematician works. They first grasp the problem structure, visualize the geometric path from premise to conclusion, and only then write the steps. The writing is a *transcription* of an already-completed reasoning process — not the reasoning itself.
+
+DLR replicates this workflow:
+
+- The **Text-JEPA** learns to represent reasoning states as points in a continuous $d$-dimensional manifold, capturing the logical "momentum" of a proof.
+- The **Flow Expert** acts as a logic physics engine, computing the shortest geometrically valid path between the premise and the conclusion using Rectified Flow.
+- The **Decoder** reads this pre-computed trajectory and transcribes it into text.
+
+The critical insight is that **reasoning happens in continuous space, not in token space**. Token generation is a post-hoc decoding step, not a cognitive one.
+
+---
+
+## Architecture
+
+### Module A: Text-JEPA & The Oracle (Semantic Anchor)
+
+A 1D-sequence adaptation of I-JEPA for structured mathematical reasoning, heavily modified to prevent dimensional collapse and eliminate target leakage.
+
+**The Oracle Predictor**: To prevent the model from "cheating" by peeking at the ground-truth conclusion, an Oracle network predicts the final proof state ($\hat{z}_{final}$) strictly from the premise ($z_0$).
+
+$$\mathcal{L}_{Oracle} = \| \hat{z}_{final} - \text{sg}(z_{final}) \|^2_2$$
+
+**VICReg Objective**: The JEPA is trained using Variance-Invariance-Covariance Regularization to ensure the latent space remains expansive and structurally meaningful.
+
+$$\mathcal{L}_{JEPA} = \lambda \mathcal{L}_{inv} + \mu \mathcal{L}_{var} + \nu \mathcal{L}_{cov}$$
+
+| Component | Role | Gradient |
+|---|---|---|
+| Context Encoder $E_x$ | Encodes premise + previous steps | ✓ Trainable |
+| Target Encoder $E_y$ | Encodes the ground-truth next step (via EMA) | ✗ Frozen (EMA) |
+| Oracle Predictor $P_{macro}$ | Deep MLP predicting $\hat{z}_{final}$ from $z_0$ | ✓ Trainable |
+| Step Predictor $P_{micro}$ | Narrow MLP with learned "next-step" embedding | ✓ Trainable |
+
+### Module B: Rectified Flow Expert (Logic Engine)
+
+A DiT-based (Diffusion Transformer) model that generates continuous reasoning trajectories from noise via Rectified Flow. Crucially, the model is conditioned on the **predicted** endpoint ($\hat{z}_{final}$), forcing it to autonomously bridge the gap without ground-truth leakage.
+
+**Rectified Flow Formulation:**
+
+$$x_t = t \cdot Z_{true} + (1-t) \cdot \epsilon, \quad \epsilon \sim \mathcal{N}(0, I)$$
+$$v_{true} = Z_{true} - \epsilon$$
+
+**The Energy Critic:** To ensure trajectories do not drift through mathematically invalid latent space, the loss incorporates an Energy Function $\mathcal{E}(x_t)$ that penalizes representations of logical contradictions.
+
+$$\mathcal{L}_{flow} = \mathbb{E}_{t, \varepsilon} \left[ \| v_\theta(x_t, t, z_0, \hat{z}_{final}) - v_{true} \|^2 \cdot \mathbf{m} + \alpha \mathcal{E}(x_t) \right]$$
+
+**Unified Trajectory Architecture:** The Flow Expert receives the premise and predicted goal via Adaptive Layer Normalization (AdaLN).
+
+$$\text{cond} = \text{MLP}([z_0 \mid \hat{z}_{final} \mid \phi(t)])$$
+
+### Module C: Scribe Decoder (Y-Decoder)
+
+A lightweight causal decoder that translates the $N \times d$ continuous trajectory into discrete text tokens via sliding-window cross-attention.
+
+**Sliding Window Constraint:** Token $i$ attends only to trajectory waypoints $[k-w, k+w]$ where $k = \lfloor i \cdot N/L \rfloor$. This prevents attention smearing and enforces local trajectory-to-token alignment.
+
+**Weight Tying:** The input embedding matrix and lm_head output projection share weights, halving parameter count on the vocabulary dimension.
+
+**End-to-End Transcription:** At inference, the decoder reads purely generated trajectories, acting as a true test of the Flow Expert's reasoning validity.
+
+---
+
+## Key Design Decisions
+
+**Autonomous Goal Formulation:** By forcing the system to predict its own endpoint ($\hat{z}_{final}$) before reasoning begins, we align the architecture with genuine problem-solving rather than supervised interpolation.
+
+**VICReg Anti-Collapse:** Replacing simple L2 variance monitors with explicit Variance and Covariance penalties ensures that the "Geometry of Not Being Wrong" maintains a rigid, high-fidelity topology where distance equates to logical divergence.
+
+**Unified Trajectory Cache (No Double-Dip):** The JEPA's cumulative encoding compresses the full problem context into $z_0 = E_y(\text{[PREMISE]})$. The Flow Expert receives $z_0$ via AdaLN, eliminating the need for a massive token-level KV cache. Memory reduction: from $[S \times d] + [N \times d]$ to $[N \times d]$ only.
+
+**Custom Math-Native Tokenizer:** A BPE tokenizer trained directly on the mathematical reasoning corpus. Numbers remain intact as single tokens (e.g., `256`), and structural tokens (`[PREMISE]`, `[STEP]`) are native entries.
+
+---
+
+## Evaluation Protocol
+
+Four strict metrics designed to isolate each stage of the information pipeline, with zero oracle leakage at inference:
+
+| Metric | What It Measures | Success Criterion |
+|---|---|---|
+| **A. VICReg Stability** | Variance and Covariance losses over training | Rapid stabilization without dimensional collapse |
+| **B. Oracle Accuracy** | $\| \hat{z}_{final} - z_{true\_final} \|$ | Oracle successfully maps premise to valid proof sink |
+| **C. Flow Trajectory Validity** | $\mathcal{E}(Z_{generated})$ | Generated trajectories maintain low energy (valid logic) |
+| **D. End-to-End Recovery** | Exact match of numbers/operators decoded from generated flows | Above baseline (>10% at PoC scale) |
+
+---
+
+## Compute Optimization
+
+The implementation employs a layered optimization strategy:
+
+| Layer | Mechanism | Effect |
+|---|---|---|
+| Graph Compilation | `torch.compile` | Operator fusion, 1.3-2× throughput |
+| Mixed Precision | BF16 autocast (forward) + FP32 (EMA) | 2× memory reduction, 2× throughput |
+| Matrix Precision | TF32 matmul on Ampere+ | Free 2-3× speedup on matmuls |
+| Fused Kernels | Liger fused cross-entropy (decoder) | Avoids materializing $[B \cdot L, V]$ logits |
+
+**Safety invariant:** EMA updates always execute in FP32 on the uncompiled model to prevent silent corruption of the target encoder geometry.
+
+---
+
+## Repository Structure
+
+```
+dlr/
 ├── config.py               # Hyperparameters, compute opts, PoC + production profiles
-├── data_pipeline.py        # NuminaMath-CoT loading, step parsing, datasets
-├── train_tokenizer.py      # Custom math BPE tokenizer training
+├── data_pipeline.py         # NuminaMath-CoT loading, step parsing, datasets
+├── train_tokenizer.py       # Custom math BPE tokenizer training
 ├── modules/
-│   ├── text_jepa.py        # Module A: Encoders, Micro-Predictor, Oracle, VICReg
-│   ├── flow_expert.py      # Module B: DiT + AdaLN + Energy Critic
-│   └── decoder.py          # Module C: Causal decoder + sliding-window cross-attn
-├── train_jepa.py           # Phase 1: JEPA + Oracle training (VICReg)
-├── extract_trajectories.py # Phase 1.5: Frozen encoder extraction
-├── train_flow.py           # Phase 2: Flow training with Energy Penalty
-├── train_decoder.py        # Phase 3: Decoder training (Liger CE)
-├── visualize.py            # Strict End-to-End evaluation dashboard
-├── run_poc.py              # Master orchestrator (--production for H200/B200)
-└── requirements.txt
-Related WorkI-JEPA (Assran et al., 2023) & VICReg (Bardes et al., 2022): Joint embedding prediction and regularization; DLR adapts this to 1D continuous logic sequences.Rectified Flow (Liu et al., 2022): Optimal-transport ODE for straight-line generative flows; DLR applies this to discrete reasoning trajectories.AlphaGeometry (Trinh et al., 2024): Language-model intuition verified by symbolic engines; DLR continuous analog uses the Energy Critic to evaluate logical leaps.
+│   ├── text_jepa.py         # Module A: Encoders, Micro-Predictor, Oracle, VICReg
+│   ├── flow_expert.py       # Module B: DiT + AdaLN + Rectified Flow + Heun solver
+│   ├── decoder.py           # Module C: Causal decoder + sliding-window cross-attn
+│   ├── oracle.py            # Oracle: Deep residual MLP for goal prediction
+│   ├── vicreg.py            # VICReg: Variance-Invariance-Covariance loss
+│   └── energy_critic.py     # Energy Critic: Manifold guardrail
+├── train_jepa.py            # Phase 1: JEPA + Oracle training (VICReg)
+├── extract_trajectories.py  # Phase 1.5: Frozen encoder extraction
+├── train_flow.py            # Phase 2: Flow training with Energy Penalty
+├── train_decoder.py         # Phase 3: Decoder training (Liger CE)
+├── visualize.py             # Strict end-to-end evaluation dashboard
+├── run_poc.py               # Master orchestrator (--production for H200/B200)
+├── RUNBOOK.md               # Production execution guide
+└── requirements.txt         # Dependencies
+```
+
+---
+
+## Usage
+
+```bash
+# Install
+pip install -r requirements.txt
+
+# Train math tokenizer
+python train_tokenizer.py --vocab-size 8192 --n-samples 5000
+
+# Validate data pipeline
+python test_data_pipeline.py --n-samples 500
+
+# PoC run (d=128, ~7h on RTX 4090)
+python run_poc.py
+
+# Production run (d=1024, ~14-18h on H200/B200)
+python run_poc.py --production
+
+# Resume from specific phase
+python run_poc.py --production --skip-to flow
+```
+
+---
+
+## Data
+
+Training data is sourced from **NuminaMath-CoT** (AI-MO), a corpus of ~860,000 mathematical problems with structured chain-of-thought solutions spanning arithmetic, algebra, geometry, combinatorics, and number theory.
+
+Solutions are parsed into discrete reasoning steps using a multi-strategy parser (explicit markers → numbered lists → paragraph boundaries → line boundaries), yielding an average of 6.6 steps per problem with a mean context length of 177 words.
+
+---
+
+## Related Work
+
+- **I-JEPA** (Assran et al., 2023) & **VICReg** (Bardes et al., 2022): Joint embedding prediction and regularization; DLR adapts this to 1D continuous logic sequences.
+- **Rectified Flow** (Liu et al., 2022): Optimal-transport ODE for straight-line generative flows; DLR applies this to discrete reasoning trajectories.
+- **AlphaGeometry** (Trinh et al., 2024): Language-model intuition verified by symbolic engines; DLR's continuous analog uses the Energy Critic to evaluate logical leaps.
+
+---
+
+## License
+
+MIT
