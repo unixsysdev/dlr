@@ -64,7 +64,7 @@ A DiT-based (Diffusion Transformer) model that generates continuous reasoning tr
 $$x_t = t \cdot Z_{true} + (1-t) \cdot \epsilon, \quad \epsilon \sim \mathcal{N}(0, I)$$
 $$v_{true} = Z_{true} - \epsilon$$
 
-**The Energy Critic:** To ensure trajectories do not drift through mathematically invalid latent space, the loss incorporates an Energy Function $\mathcal{E}(x_t)$ that penalizes representations of logical contradictions.
+**The Energy Critic:** The current critic is a manifold regularizer, not a symbolic verifier. It is trained to assign low energy to real latent waypoints and high energy to perturbed off-manifold samples, reducing latent drift during flow generation.
 
 $$\mathcal{L}_{flow} = \mathbb{E}_{t, \varepsilon} \left[ \| v_\theta(x_t, t, z_0, \hat{z}_{final}) - v_{true} \|^2 \cdot \mathbf{m} + \alpha \mathcal{E}(x_t) \right]$$
 
@@ -80,7 +80,7 @@ A lightweight causal decoder that translates the $N \times d$ continuous traject
 
 **Weight Tying:** The input embedding matrix and lm_head output projection share weights, halving parameter count on the vocabulary dimension.
 
-**End-to-End Transcription:** At inference, the decoder reads purely generated trajectories, acting as a true test of the Flow Expert's reasoning validity.
+**End-to-End Transcription:** At inference, the decoder reads purely generated trajectories under strict greedy decoding, making evaluation deterministic.
 
 ---
 
@@ -94,26 +94,29 @@ A lightweight causal decoder that translates the $N \times d$ continuous traject
 
 **Hard Boundary Enforcement:** The generated trajectory is physically clamped: $x_0 = z_0$ after every ODE integration step. Boundary conditions are enforced as hard physics, not soft AdaLN suggestions.
 
-**Spectral Normalization (Energy Critic):** All linear layers in the Energy Critic use spectral normalization to guarantee Lipschitz stability and prevent energy explosion. Gradients flow through the velocity field into the Flow Expert — the penalty is not decorative.
+**Spectral Normalization (Energy Critic):** All linear layers in the Energy Critic use spectral normalization to guarantee Lipschitz stability and prevent energy explosion. Gradients flow through the velocity field into the Flow Expert, but this remains a manifold regularizer rather than a logical contradiction detector.
+
+**Oracle Exposure During Flow Training:** The Flow Expert no longer trains only against perfect endpoints. A configurable fraction of batches swaps the ground-truth target for the Oracle's predicted goal, reducing the train/eval mismatch when the Oracle is imperfect.
 
 **Unified Trajectory Cache (No Double-Dip):** The JEPA's cumulative encoding compresses the full problem context into $z_0 = E_y(\text{[PREMISE]})$. The Flow Expert receives $z_0$ via AdaLN, eliminating the need for a massive token-level KV cache. Memory reduction: from $[S \times d] + [N \times d]$ to $[N \times d]$ only.
 
 **Custom Math-Native Tokenizer:** A BPE tokenizer trained directly on the mathematical reasoning corpus. Numbers remain intact as single tokens (e.g., `256`), and structural tokens (`[PREMISE]`, `[STEP]`) are native entries.
 
-**Train/Test Hygiene:** Explicit 90/10 data split. All evaluation metrics (including Metric E) run exclusively on held-out test problems. No training data contaminates the evaluation dashboard.
+**Train/Test Hygiene:** Explicit 90/10 data split. Metric D remains a train-split diagnostic on extracted `Z_true`, while Metric E encodes held-out test premises on the fly and never loads `trajectories.pt`. No training trajectories contaminate the honest dashboard.
 
 ---
 
 ## Evaluation Protocol
 
-Four strict metrics designed to isolate each stage of the information pipeline, with zero oracle leakage at inference. All evaluation runs on a **held-out test split** (10% of the dataset, disjoint from training).
+Five strict metrics designed to isolate each stage of the information pipeline. Metric D is a train-split decoder diagnostic on `Z_true`; Metric E is the held-out honest test and encodes premises on the fly.
 
 | Metric | What It Measures | Success Criterion |
 |---|---|---|
 | **A. VICReg Stability** | Variance and Covariance losses over training | Rapid stabilization without dimensional collapse |
 | **B. Oracle Accuracy** | $\| \hat{z}_{final} - z_{conclusion} \|$ (true conclusion, not step k+1) | Oracle maps premise to valid proof sink |
 | **C. Flow Trajectory Validity** | $\mathcal{E}(Z_{generated})$ + hard boundary check | Generated trajectories start at $z_0$ and maintain low energy |
-| **D. End-to-End Recovery** | Exact match of numbers/operators decoded from generated flows | Above baseline (>10% at PoC scale) on held-out data |
+| **D. Token Recovery (diagnostic)** | Exact match of numbers/operators decoded from extracted `Z_true` | Decoder can read latent trajectories at all |
+| **E. Honest Full Pipeline** | Held-out premise → JEPA → Oracle → Flow → Decoder, plus final-answer exact match | Non-zero held-out recovery without trajectory leakage |
 
 ---
 
@@ -194,7 +197,7 @@ Solutions are parsed into discrete reasoning steps using a multi-strategy parser
 
 - **I-JEPA** (Assran et al., 2023) & **VICReg** (Bardes et al., 2022): Joint embedding prediction and regularization; DLR adapts this to 1D continuous logic sequences.
 - **Rectified Flow** (Liu et al., 2022): Optimal-transport ODE for straight-line generative flows; DLR applies this to discrete reasoning trajectories.
-- **AlphaGeometry** (Trinh et al., 2024): Language-model intuition verified by symbolic engines; DLR's continuous analog uses the Energy Critic to evaluate logical leaps.
+- **AlphaGeometry** (Trinh et al., 2024): Language-model intuition verified by symbolic engines; DLR would need a symbolic verifier of this class for actual logical validation beyond latent-manifold regularization.
 
 ---
 

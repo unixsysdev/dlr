@@ -5,9 +5,10 @@ Trains the DiT-based Flow Expert to generate continuous
 reasoning trajectories from noise → Z_true, with an Energy
 Critic that penalizes off-manifold trajectories.
 
-V4 Architecture:
-  - Flow Expert uses ẑ_final from Oracle (NOT ground-truth z_target)
-    during evaluation, but ground-truth during training for stability.
+V5 Architecture:
+  - Flow Expert uses scheduled Oracle replacement during training:
+    most batches use ground-truth z_target, but a fraction use ẑ_final
+    so the model learns to handle Oracle error at inference.
   - Energy Critic trains on contrastive pairs: real waypoints (low energy)
     vs. perturbed waypoints (high energy).
   - Energy penalty added to flow loss: α · E(predicted_endpoint)
@@ -28,10 +29,11 @@ from tqdm import tqdm
 from config import DLRConfig
 from modules.flow_expert import FlowExpert, masked_mse_loss
 from modules.energy_critic import EnergyCritic, energy_contrastive_loss, flow_energy_penalty
+from modules.text_jepa import TextJEPA
 from data_pipeline import TrajectoryDataset
 
 
-def train_flow(config: DLRConfig) -> dict:
+def train_flow(config: DLRConfig, jepa_model: TextJEPA = None) -> dict:
     """
     Train the Flow Expert + Energy Critic and return training history.
 
@@ -61,7 +63,7 @@ def train_flow(config: DLRConfig) -> dict:
     )
 
     # ── Models ──────────────────────────────────────────────────
-    print("\n[2/3] Building Flow Expert + Energy Critic...")
+    print("\n[2/4] Building Flow Expert + Energy Critic...")
 
     flow_model = FlowExpert(
         d_model=config.d_model,
@@ -82,6 +84,33 @@ def train_flow(config: DLRConfig) -> dict:
     print(f"  Flow Expert params: {flow_params:,}")
     print(f"  Energy Critic params: {critic_params:,}")
 
+    if jepa_model is None:
+        print("\n[3/4] Loading frozen JEPA Oracle...")
+        jepa_ckpt = torch.load(
+            os.path.join(config.checkpoint_dir, "jepa_final.pt"),
+            map_location=device,
+            weights_only=False,
+        )
+        jepa_model = TextJEPA(
+            vocab_size=jepa_ckpt["vocab_size"],
+            d_model=config.d_model,
+            n_heads=config.n_heads,
+            n_layers=config.encoder_layers,
+            predictor_hidden=config.predictor_hidden,
+            dropout=0.0,
+            ff_mult=config.ff_mult,
+            max_len=config.max_seq_len,
+            oracle_layers=config.oracle_layers,
+            oracle_expansion=config.oracle_expansion,
+        ).to(device)
+        jepa_model.load_state_dict(jepa_ckpt["model_state_dict"])
+    else:
+        print("\n[3/4] Using provided JEPA Oracle...")
+
+    jepa_model.eval()
+    for p in jepa_model.parameters():
+        p.requires_grad = False
+
     # Separate optimizers (alternating updates)
     flow_optimizer = torch.optim.AdamW(
         flow_model.parameters(),
@@ -100,14 +129,16 @@ def train_flow(config: DLRConfig) -> dict:
     # Don't compile the critic — it's small and alternates training
 
     # ── Training Loop ───────────────────────────────────────────
-    print(f"\n[3/3] Training for {config.flow_epochs} epochs...")
+    print(f"\n[4/4] Training for {config.flow_epochs} epochs...")
     print(f"  Energy penalty weight α = {config.energy_penalty_weight}")
     print(f"  Noise std for negatives: {config.energy_noise_std}")
+    print(f"  Oracle exposure rate = {config.oracle_exposure_rate:.0%}")
 
     history = {
         "loss": [], "epoch_loss": [],
         "flow_loss": [], "energy_penalty": [],
         "critic_loss": [],
+        "oracle_exposure": [],
     }
     t_start = time.time()
 
@@ -131,6 +162,18 @@ def train_flow(config: DLRConfig) -> dict:
             z_0 = Z_true[:, 0, :]                           # [B, d]
 
             B = Z_true.shape[0]
+
+            # Scheduled Oracle replacement:
+            # expose the flow model to predicted goals so evaluation-time
+            # Oracle error is no longer out-of-distribution.
+            use_oracle = torch.rand(B, device=device) < config.oracle_exposure_rate
+            if use_oracle.any():
+                with torch.no_grad():
+                    z_hat = jepa_model.predict_goal(z_0[use_oracle])
+                z_cond = z_target.clone()
+                z_cond[use_oracle] = z_hat
+            else:
+                z_cond = z_target
 
             # ══════════════════════════════════════════════════
             # Step 1: Update Energy Critic (contrastive pairs)
@@ -163,7 +206,7 @@ def train_flow(config: DLRConfig) -> dict:
 
             # Forward (BF16 autocast)
             with config.autocast_ctx:
-                v_pred = flow_model(x_t, t, z_0, z_target)  # [B, N, d]
+                v_pred = flow_model(x_t, t, z_0, z_cond)  # [B, N, d]
 
                 # Masked MSE loss (Velocity Zero-Out)
                 flow_mse = masked_mse_loss(v_pred, v_true, active_mask)
@@ -186,6 +229,7 @@ def train_flow(config: DLRConfig) -> dict:
             history["flow_loss"].append(flow_mse.item())
             history["energy_penalty"].append(e_penalty.item())
             history["critic_loss"].append(critic_loss.item())
+            history["oracle_exposure"].append(use_oracle.float().mean().item())
             epoch_loss += loss.item()
             n_batches += 1
 
@@ -193,6 +237,7 @@ def train_flow(config: DLRConfig) -> dict:
                 flow=f"{flow_mse.item():.4f}",
                 e_pen=f"{e_penalty.item():.3f}",
                 crit=f"{critic_loss.item():.3f}",
+                ora=f"{use_oracle.float().mean().item():.2f}",
             )
 
         avg_loss = epoch_loss / max(n_batches, 1)

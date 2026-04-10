@@ -65,6 +65,7 @@ class DLRConfig:
     oracle_layers: int = 4            # Depth of Oracle residual MLP
     oracle_expansion: int = 4         # FFN expansion factor
     oracle_loss_weight: float = 1.0   # Weight of Oracle loss in total
+    oracle_exposure_rate: float = 0.2  # Mix Oracle goals into flow training
 
     # ── Energy Critic (Manifold Guardrail) ────────────────────────
     energy_hidden: int = 256          # Critic hidden dim
@@ -76,7 +77,7 @@ class DLRConfig:
     # ── ODE Solver ──────────────────────────────────────────────────
     ode_steps: int = 50          # Euler integration steps
     ode_solver: str = "heun"     # 'euler' (fast) or 'heun' (accurate)
-    eval_temperature: float = 0.01  # Near-greedy for PoC clarity
+    eval_temperature: float = 0.0  # 0.0 = strict greedy decoding for eval
 
     # ── Compute Optimization ────────────────────────────────────────
     use_compile: bool = True     # torch.compile (graph compilation)
@@ -182,6 +183,7 @@ def production_config() -> DLRConfig:
         oracle_layers=6,
         oracle_expansion=4,
         oracle_loss_weight=1.0,
+        oracle_exposure_rate=0.2,
 
         # Energy Critic
         energy_hidden=512,
@@ -193,7 +195,7 @@ def production_config() -> DLRConfig:
         # ODE
         ode_steps=100,
         ode_solver="heun",
-        eval_temperature=0.01,
+        eval_temperature=0.0,
 
         # Compute — all optimizations ON
         use_compile=True,

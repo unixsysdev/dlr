@@ -2,7 +2,7 @@
 Energy Critic — Manifold Guardrail for Trajectories
 
 Learns an energy function E(z) → scalar that distinguishes
-valid proof states (on-manifold) from invalid states (off-manifold).
+in-manifold latent states from perturbed off-manifold states.
 
 Architecture: MLP with spectral normalization for Lipschitz stability.
 Spectral norm constrains the largest singular value of each weight
@@ -15,7 +15,7 @@ Training:
 
 The energy penalty is added to the Flow Expert's loss, forcing
 the velocity field to curve around high-energy "mountains" of
-logical contradiction rather than cutting through them.
+latent drift rather than cutting through them.
 
 Loss: Margin-based contrastive
   L = E[E(z_pos)] + E[max(0, margin - E(z_neg))]
@@ -30,8 +30,8 @@ class EnergyCritic(nn.Module):
     """
     Energy function E(z) → scalar.
 
-    Low energy = valid proof state (on the learned manifold).
-    High energy = invalid state (hallucination, logical error).
+    Low energy = in-manifold proof state.
+    High energy = perturbed or off-manifold latent state.
 
     Architecture: MLP with spectral normalization on all linear layers
     for Lipschitz stability (prevents energy explosion).

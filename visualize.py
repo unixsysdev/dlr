@@ -1,11 +1,12 @@
 """
 DLR Overnight PoC — Visualization & Evaluation Dashboard
 
-Implements the four evaluation metrics:
+Implements the evaluation metrics:
   A. JEPA Collapse Variance
   B. Cosine Monotonicity
   C. Flow Convergence (endpoint L2)
-  D. Token Recovery Rate (number/operator exact match)
+  D. Token Recovery Rate (number/operator exact match, diagnostic on Z_true)
+  E. Full Pipeline Recovery + Final Answer Exact Match (held-out test only)
 
 Plus training curve plots and trajectory visualizations.
 """
@@ -363,6 +364,27 @@ def extract_math_tokens(text: str) -> set:
     return numbers | operators | words
 
 
+def extract_final_answer(text: str) -> str:
+    """Extract a boxed answer or the last simple equation-like answer."""
+    boxed_match = re.search(r"\\boxed\{([^}]*)\}", text)
+    if boxed_match:
+        return boxed_match.group(1).strip()
+
+    equations = re.findall(
+        r"([a-zA-Z0-9_]+)\s*=\s*([a-zA-Z0-9_\.\-\/]+)",
+        text,
+    )
+    if equations:
+        lhs, rhs = equations[-1]
+        return f"{lhs}={rhs}"
+    return ""
+
+
+def normalize_answer(text: str) -> str:
+    """Normalize extracted answers before exact-match comparison."""
+    return re.sub(r"\s+", "", text.strip())
+
+
 def evaluate_token_recovery(
     decoder_model,
     data_dir: str,
@@ -395,7 +417,7 @@ def evaluate_token_recovery(
             bos_token_id=bos_id,
             eos_token_id=eos_id,
             max_length=config.decoder_max_seq_len,
-            temperature=config.eval_temperature,  # Near-greedy for PoC clarity
+            temperature=config.eval_temperature,
         )
 
         gen_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
@@ -428,6 +450,10 @@ def evaluate_token_recovery(
             "recovered": list(recovered),
             "recovery_rate": recovery_rate,
         })
+
+    if not results:
+        print("  ⚠ No aligned trajectories found for Metric D, skipping")
+        return []
 
     # Plot
     rates = [r["recovery_rate"] for r in results]
@@ -475,9 +501,8 @@ def evaluate_full_pipeline(
     jepa_model,
     flow_model,
     decoder_model,
-    data_dir: str,
     plot_dir: str,
-    parsed_problems: list,
+    parsed_problems_test: list,
     tokenizer,
     config,
     n_samples: int = 10,
@@ -492,12 +517,7 @@ def evaluate_full_pipeline(
         4. Decoder translates Z_gen into text
         5. Compare against ground truth
     """
-    traj_path = os.path.join(data_dir, "trajectories.pt")
-    data = torch.load(traj_path, weights_only=False)
     device = config.device
-
-    Z_true = data["Z_true"][:n_samples].to(device)
-    indices = data["problem_indices"][:n_samples]
 
     jepa_model.eval()
     flow_model.eval()
@@ -507,40 +527,47 @@ def evaluate_full_pipeline(
     eos_id = tokenizer.sep_token_id
 
     results = []
-    for i in range(min(n_samples, len(Z_true))):
-        # Step 1: z_0 from trajectory (premise)
-        z_0 = Z_true[i, 0:1, :]  # [1, d]
+    for i, item in enumerate(parsed_problems_test[:n_samples]):
+        problem = item["problem"]
+        gt_steps = item["steps"]
+        gt_text = " ".join(gt_steps)
 
-        # Step 2: Oracle predicts goal (NO ground-truth leakage)
-        z_hat_final = jepa_model.predict_goal(z_0)  # [1, d]
+        text = f"[PREMISE] {problem} [/PREMISE]"
+        tokens = tokenizer(
+            text,
+            max_length=config.max_seq_len,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        ).to(device)
 
-        # Step 3: Flow generates trajectory from noise
-        Z_gen = flow_model.generate(
-            z_0, z_hat_final,
-            n_steps=config.ode_steps,
-            solver=config.ode_solver,
-        )  # [1, N, d]
+        with torch.no_grad():
+            z_0, _ = jepa_model.encode(tokens["input_ids"], tokens["attention_mask"])
+            z_hat_final = jepa_model.predict_goal(z_0)
+            Z_gen = flow_model.generate(
+                z_0,
+                z_hat_final,
+                n_steps=config.ode_steps,
+                solver=config.ode_solver,
+            )
+            generated_ids = decoder_model.generate(
+                Z_gen,
+                bos_token_id=bos_id,
+                eos_token_id=eos_id,
+                max_length=config.decoder_max_seq_len,
+                temperature=config.eval_temperature,
+            )
 
-        # Step 4: Decoder translates to text
-        generated_ids = decoder_model.generate(
-            Z_gen,
-            bos_token_id=bos_id,
-            eos_token_id=eos_id,
-            max_length=config.decoder_max_seq_len,
-            temperature=config.eval_temperature,
-        )
         gen_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-
-        # Step 5: Compare against ground truth
-        prob_idx = indices[i]
-        if prob_idx < len(parsed_problems):
-            gt_steps = parsed_problems[prob_idx]["steps"]
-            gt_text = " ".join(gt_steps)
-        else:
-            gt_text = ""
 
         gen_tokens = extract_math_tokens(gen_text)
         gt_tokens = extract_math_tokens(gt_text)
+        gen_final_answer = extract_final_answer(gen_text)
+        gt_final_answer = extract_final_answer(gt_text)
+        final_answer_exact_match = int(
+            bool(gen_final_answer)
+            and normalize_answer(gen_final_answer) == normalize_answer(gt_final_answer)
+        )
 
         if gt_tokens:
             recovered = gen_tokens & gt_tokens
@@ -550,26 +577,44 @@ def evaluate_full_pipeline(
             recovery_rate = 0.0
 
         results.append({
-            "problem_idx": prob_idx,
+            "problem_idx": i,
+            "problem": problem[:200],
             "generated": gen_text[:200],
             "ground_truth": gt_text[:200],
             "recovery_rate": recovery_rate,
             "recovered": list(recovered),
+            "generated_final_answer": gen_final_answer,
+            "ground_truth_final_answer": gt_final_answer,
+            "final_answer_exact_match": final_answer_exact_match,
         })
+
+    if not results:
+        print("  ⚠ No held-out problems available for Metric E, skipping")
+        return []
 
     # Plot
     rates = [r["recovery_rate"] for r in results]
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.bar(range(len(rates)), rates, color="#ff6b6b", alpha=0.8)
-    ax.axhline(y=np.mean(rates), color="#ffcc00", linestyle="--",
-               label=f"Mean: {np.mean(rates):.2%}")
-    ax.set_title("Metric E: Full Pipeline Recovery (Oracle→Flow→Decoder)\n"
-                 "HONEST TEST — No ground-truth leakage",
-                 fontweight="bold")
-    ax.set_xlabel("Problem")
-    ax.set_ylabel("Recovery Rate")
-    ax.set_ylim(0, 1.1)
-    ax.legend()
+    answer_matches = [r["final_answer_exact_match"] for r in results]
+    fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+
+    axes[0].bar(range(len(rates)), rates, color="#ff6b6b", alpha=0.8)
+    axes[0].axhline(y=np.mean(rates), color="#ffcc00", linestyle="--",
+                    label=f"Mean: {np.mean(rates):.2%}")
+    axes[0].set_title("Metric E: Full Pipeline Token Recovery",
+                      fontweight="bold")
+    axes[0].set_xlabel("Problem")
+    axes[0].set_ylabel("Recovery Rate")
+    axes[0].set_ylim(0, 1.1)
+    axes[0].legend()
+
+    axes[1].bar(range(len(answer_matches)), answer_matches, color="#00ff88", alpha=0.8)
+    axes[1].axhline(y=np.mean(answer_matches), color="#ffcc00", linestyle="--",
+                    label=f"Final answer EM: {np.mean(answer_matches):.2%}")
+    axes[1].set_title("Final Answer Exact Match", fontweight="bold")
+    axes[1].set_xlabel("Problem")
+    axes[1].set_ylabel("Exact Match")
+    axes[1].set_ylim(0, 1.1)
+    axes[1].legend()
 
     plt.tight_layout()
     plt.savefig(os.path.join(plot_dir, "08_full_pipeline_recovery.png"),
@@ -578,6 +623,7 @@ def evaluate_full_pipeline(
 
     print(f"  ✓ Saved 08_full_pipeline_recovery.png")
     print(f"    Mean full-pipeline recovery: {np.mean(rates):.2%}")
+    print(f"    Final answer exact match: {np.mean(answer_matches):.2%}")
 
     # Print samples
     print("\n  ── Full Pipeline Samples (Honest) ──")
@@ -586,9 +632,12 @@ def evaluate_full_pipeline(
         print(f"    GT:  {r['ground_truth'][:120]}...")
         print(f"    Gen: {r['generated'][:120]}...")
         print(f"    Recovered: {r['recovered']} ({r['recovery_rate']:.0%})")
+        print(f"    Final answer: GT={r['ground_truth_final_answer']!r} | "
+              f"Gen={r['generated_final_answer']!r} | "
+              f"EM={bool(r['final_answer_exact_match'])}")
 
     # Save
-    results_path = os.path.join(data_dir, "full_pipeline_results.json")
+    results_path = os.path.join(config.data_dir, "full_pipeline_results.json")
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2)
 
@@ -644,7 +693,8 @@ def generate_full_dashboard(
     jepa_model=None,
     flow_model=None,
     decoder_model=None,
-    parsed_problems=None,
+    parsed_problems_train=None,
+    parsed_problems_test=None,
     tokenizer=None,
 ):
     """Generate the complete evaluation dashboard."""
@@ -674,24 +724,23 @@ def generate_full_dashboard(
     plot_decoder_training(config.data_dir, config.plot_dir)
 
     # Metric D: Token recovery on Z_true (diagnostic, not primary)
-    if decoder_model is not None and parsed_problems is not None and tokenizer is not None:
+    if decoder_model is not None and parsed_problems_train is not None and tokenizer is not None:
         print("\n── Metric D: Token Recovery (Z_true — diagnostic) ──")
         evaluate_token_recovery(
             decoder_model, config.data_dir, config.plot_dir,
-            parsed_problems, tokenizer, config,
+            parsed_problems_train, tokenizer, config,
         )
 
     # Metric E: Full pipeline (HONEST — primary pass/fail)
     if (jepa_model is not None and flow_model is not None
-            and decoder_model is not None and parsed_problems is not None
+            and decoder_model is not None and parsed_problems_test is not None
             and tokenizer is not None):
         print("\n── Metric E: Full Pipeline Recovery (HONEST) ──")
         evaluate_full_pipeline(
             jepa_model, flow_model, decoder_model,
-            config.data_dir, config.plot_dir,
-            parsed_problems, tokenizer, config,
+            config.plot_dir,
+            parsed_problems_test, tokenizer, config,
         )
 
     print(f"\n  All plots saved to {config.plot_dir}/")
     print("=" * 60)
-

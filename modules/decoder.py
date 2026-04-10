@@ -215,10 +215,13 @@ class ScribeDecoder(nn.Module):
 
         for _ in range(max_length - 1):
             logits = self.forward(generated, trajectory)  # [B, L, V]
-            next_logits = logits[:, -1, :] / temperature   # [B, V]
-            next_token = torch.multinomial(
-                torch.softmax(next_logits, dim=-1), num_samples=1
-            )  # [B, 1]
+            if temperature <= 1e-4:
+                next_token = torch.argmax(logits[:, -1, :], dim=-1, keepdim=True)
+            else:
+                next_logits = logits[:, -1, :] / temperature   # [B, V]
+                next_token = torch.multinomial(
+                    torch.softmax(next_logits, dim=-1), num_samples=1
+                )  # [B, 1]
             generated = torch.cat([generated, next_token], dim=1)
 
             # Stop if all sequences have produced EOS

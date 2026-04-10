@@ -37,9 +37,11 @@ tail -f dlr_run.log
 | Oracle layers | 6 |
 | Pooling | Attention-weighted (learned query) |
 | Batch sizes | 256/128/128 |
+| Oracle exposure | 20% target replacement during flow training |
 | ODE solver | Heun (2nd order) + hard boundary |
 | VICReg | λ_inv=25, λ_var=25, λ_cov=1 |
-| Energy Critic | Spectral norm + gradient-preserving penalty |
+| Eval decoding | Greedy (`temperature=0.0`) |
+| Energy Critic | Spectral norm + manifold regularization penalty |
 | Energy penalty α | 0.1 |
 | Compute | compile + bf16 + tf32 + liger |
 
@@ -120,7 +122,7 @@ data/
   jepa_history.json       # Phase 1 metrics (VICReg + Oracle losses)
   flow_history.json       # Phase 2 metrics (flow + energy + critic)
   decoder_history.json    # Phase 3 metrics
-  full_pipeline_results.json  # Metric E honest eval results
+  full_pipeline_results.json  # Metric E honest eval results + final-answer EM
 
 plots/
   01_jepa_training.png              # VICReg sub-losses + z_var + EMA schedule
@@ -145,4 +147,4 @@ Z_gen → Decoder.generate → text
 text vs. ground_truth → recovery rate
 ```
 
-**No ground-truth leakage at any stage. No training data contamination.** If recovery rate is >10% on the held-out set, the continuous reasoning pipeline generalizes.
+**No ground-truth leakage at any stage. No training trajectory contamination.** Metric E now encodes each held-out premise directly through the JEPA instead of loading `trajectories.pt`, and reports both token recovery and final-answer exact match.

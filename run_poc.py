@@ -151,7 +151,7 @@ def main():
     if args.skip_to in (None, "extract", "flow"):
         from train_flow import train_flow
 
-        result = train_flow(config)
+        result = train_flow(config, jepa_model=jepa_model)
         flow_model = result["flow_model"]
 
     # ── PHASE 3: Train Decoder ──────────────────────────────────
@@ -221,15 +221,13 @@ def main():
         parsed_problems = parse_all_problems(train_raw, config.min_steps, config.max_steps)
         parsed_problems_test = parse_all_problems(test_raw, config.min_steps, config.max_steps)
 
-    # Use TEST split for evaluation — proves generalization, not memorization
-    eval_problems = parsed_problems_test if parsed_problems_test else parsed_problems
-
     generate_full_dashboard(
         config,
         jepa_model=jepa_model,
         flow_model=flow_model,
         decoder_model=decoder_model,
-        parsed_problems=eval_problems,
+        parsed_problems_train=parsed_problems,
+        parsed_problems_test=parsed_problems_test,
         tokenizer=tokenizer,
     )
 
