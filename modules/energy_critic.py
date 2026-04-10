@@ -98,26 +98,46 @@ def flow_energy_penalty(
     t: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Energy penalty for the flow loss.
+    Gradient-based energy penalty for the flow loss.
 
-    Penalizes predicted endpoints that land in high-energy regions.
+    Instead of projecting to the endpoint (which assumes a straight line
+    and is inconsistent with Heun's method), we compute the energy gradient
+    ∇E(x_t) and penalize velocity vectors that point toward high-energy
+    regions (steepest energy ascent).
+
+    This is solver-agnostic: it works at the current timestep regardless
+    of whether the ODE integrator uses Euler, Heun, or higher-order methods.
 
     Args:
-        critic: EnergyCritic module (frozen for this call)
+        critic: EnergyCritic module
         x_t: [B, N, d] current noisy trajectory
-        v_pred: [B, N, d] predicted velocity
-        t: [B] current timestep
+        v_pred: [B, N, d] predicted velocity (detached from critic grad)
+        t: [B] current timestep (unused, kept for API compatibility)
 
     Returns:
-        Scalar energy penalty (higher = worse predicted endpoint)
+        Scalar energy penalty (higher = velocity points toward invalid regions)
     """
-    # Where does the predicted velocity point? Project to t=1
-    t_expand = t[:, None, None]  # [B, 1, 1]
-    remaining_time = (1.0 - t_expand).clamp(min=0.01)
-    x_endpoint = x_t + v_pred * remaining_time  # [B, N, d]
+    # Enable gradient tracking on x_t for autograd
+    x_t_detached = x_t.detach().requires_grad_(True)
 
-    # Energy of predicted endpoints (detach from critic gradient)
-    with torch.no_grad():
-        energy = critic(x_endpoint)  # [B, N]
+    # Compute energy at current state
+    energy = critic(x_t_detached)  # [B, N]
+    energy_sum = energy.sum()
 
-    return energy.mean()
+    # Gradient of energy w.r.t. x_t: direction of steepest energy ascent
+    grad_e = torch.autograd.grad(
+        energy_sum, x_t_detached, create_graph=False
+    )[0]  # [B, N, d]
+
+    # Penalize velocity pointing in the direction of energy ascent
+    # cosine_similarity > 0 means velocity points toward high energy
+    v_flat = v_pred.detach().reshape(-1, v_pred.shape[-1])  # [B*N, d]
+    g_flat = grad_e.reshape(-1, grad_e.shape[-1])            # [B*N, d]
+
+    cos_sim = F.cosine_similarity(v_flat, g_flat, dim=-1)  # [B*N]
+
+    # Only penalize positive alignment (velocity toward high energy)
+    # Negative alignment means velocity points away from high energy (good)
+    penalty = F.relu(cos_sim).mean()
+
+    return penalty

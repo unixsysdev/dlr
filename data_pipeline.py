@@ -83,6 +83,11 @@ def format_context(problem: str, steps: List[str], up_to: int) -> str:
     return text
 
 
+def format_premise(problem: str) -> str:
+    """Format premise ONLY — no intermediate steps. Used for Oracle training."""
+    return f"[PREMISE] {problem} [/PREMISE]"
+
+
 def format_target(step: str) -> str:
     """Format a single step as structured text."""
     return f"[STEP] {step} [/STEP]"
@@ -151,11 +156,12 @@ def parse_all_problems(
 
 class JEPADataset(Dataset):
     """
-    Dataset for Phase 1: JEPA training.
+    Dataset for Phase 1: JEPA + Oracle training.
 
-    Yields (context, target) pairs using a sliding window:
+    Yields (context, target, premise) triples using a sliding window:
       Context = [PREMISE] problem [/PREMISE] [STEP] s1 [/STEP] ... [STEP] si [/STEP]
       Target  = [STEP] s_{i+1} [/STEP]
+      Premise = [PREMISE] problem [/PREMISE]  (Oracle gets ONLY this)
     """
 
     def __init__(
@@ -172,8 +178,9 @@ class JEPADataset(Dataset):
         for item in parsed_problems:
             problem = item["problem"]
             steps = item["steps"]
+            premise = format_premise(problem)
 
-            # Sliding window: each pair is (prefix, next_step)
+            # Sliding window: each pair is (prefix, next_step, premise)
             for i in range(len(steps) - 1):
                 context = format_context(problem, steps, i)
                 target = format_target(steps[i + 1])
@@ -186,7 +193,7 @@ class JEPADataset(Dataset):
                     skipped += 1
                     continue
 
-                self.pairs.append((context, target))
+                self.pairs.append((context, target, premise))
 
         print(f"  JEPADataset: {len(self.pairs)} context→target pairs"
               f" ({skipped} skipped due to truncation)")
@@ -195,7 +202,7 @@ class JEPADataset(Dataset):
         return len(self.pairs)
 
     def __getitem__(self, idx):
-        context, target = self.pairs[idx]
+        context, target, premise = self.pairs[idx]
 
         ctx = self.tokenizer(
             context,
@@ -211,12 +218,21 @@ class JEPADataset(Dataset):
             truncation=True,
             return_tensors="pt",
         )
+        prem = self.tokenizer(
+            premise,
+            max_length=self.max_seq_len,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
 
         return {
             "context_ids": ctx["input_ids"].squeeze(0),
             "context_mask": ctx["attention_mask"].squeeze(0),
             "target_ids": tgt["input_ids"].squeeze(0),
             "target_mask": tgt["attention_mask"].squeeze(0),
+            "premise_ids": prem["input_ids"].squeeze(0),
+            "premise_mask": prem["attention_mask"].squeeze(0),
         }
 
 

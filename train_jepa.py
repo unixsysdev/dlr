@@ -148,10 +148,10 @@ def train_jepa(config: DLRConfig) -> dict:
                     batch["context_mask"],
                     batch["target_ids"],
                     batch["target_mask"],
-                    # Pass context as premise proxy for Oracle training
-                    # (the context includes the premise)
-                    premise_ids=batch["context_ids"],
-                    premise_mask=batch["context_mask"],
+                    # Premise-only tokens: Oracle sees ONLY [PREMISE]...[/PREMISE]
+                    # NO intermediate steps — matches inference behavior
+                    premise_ids=batch["premise_ids"],
+                    premise_mask=batch["premise_mask"],
                 )
 
                 z_predicted = result["z_predicted"]

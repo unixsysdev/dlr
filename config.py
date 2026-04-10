@@ -147,7 +147,7 @@ def production_config() -> DLRConfig:
 
         # Data — 100K problems
         n_samples=100_000,
-        max_seq_len=512,
+        max_seq_len=1024,
         min_steps=2,
         max_steps=30,
 
@@ -169,7 +169,7 @@ def production_config() -> DLRConfig:
         decoder_batch_size=128,
         decoder_lr=2e-4,
         decoder_weight_decay=0.01,
-        decoder_max_seq_len=512,
+        decoder_max_seq_len=1024,
         decoder_window_half=3,
 
         # VICReg
