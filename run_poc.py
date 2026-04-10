@@ -126,7 +126,8 @@ def main():
     # Shared state between phases
     jepa_model = None
     tokenizer = None
-    parsed_problems = None
+    parsed_problems = None       # Train split — for trajectory extraction
+    parsed_problems_test = None  # Test split — for evaluation ONLY
     flow_model = None
     decoder_model = None
 
@@ -138,6 +139,7 @@ def main():
         jepa_model = result["model"]
         tokenizer = result["tokenizer"]
         parsed_problems = result["parsed_problems"]
+        parsed_problems_test = result["parsed_problems_test"]
 
     # ── PHASE 1.5: Extract Trajectories ─────────────────────────
     if args.skip_to in (None, "extract"):
@@ -215,15 +217,19 @@ def main():
 
     if parsed_problems is None:
         from data_pipeline import load_dataset_split, parse_all_problems
-        raw = load_dataset_split(config.dataset_name, config.n_samples)
-        parsed_problems = parse_all_problems(raw, config.min_steps, config.max_steps)
+        train_raw, test_raw = load_dataset_split(config.dataset_name, config.n_samples)
+        parsed_problems = parse_all_problems(train_raw, config.min_steps, config.max_steps)
+        parsed_problems_test = parse_all_problems(test_raw, config.min_steps, config.max_steps)
+
+    # Use TEST split for evaluation — proves generalization, not memorization
+    eval_problems = parsed_problems_test if parsed_problems_test else parsed_problems
 
     generate_full_dashboard(
         config,
         jepa_model=jepa_model,
         flow_model=flow_model,
         decoder_model=decoder_model,
-        parsed_problems=parsed_problems,
+        parsed_problems=eval_problems,
         tokenizer=tokenizer,
     )
 

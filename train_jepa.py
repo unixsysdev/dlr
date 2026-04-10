@@ -58,9 +58,10 @@ def train_jepa(config: DLRConfig) -> dict:
 
     # Dataset
     print("\n[2/4] Loading and parsing dataset...")
-    raw_dataset = load_dataset_split(config.dataset_name, config.n_samples)
-    parsed = parse_all_problems(raw_dataset, config.min_steps, config.max_steps)
-    print(f"  Parsed {len(parsed)} problems with valid step counts")
+    train_raw, test_raw = load_dataset_split(config.dataset_name, config.n_samples)
+    parsed = parse_all_problems(train_raw, config.min_steps, config.max_steps)
+    parsed_test = parse_all_problems(test_raw, config.min_steps, config.max_steps)
+    print(f"  Parsed {len(parsed)} train / {len(parsed_test)} test problems")
 
     if len(parsed) == 0:
         raise RuntimeError("No valid problems found! Check min_steps/max_steps.")
@@ -152,6 +153,10 @@ def train_jepa(config: DLRConfig) -> dict:
                     # NO intermediate steps — matches inference behavior
                     premise_ids=batch["premise_ids"],
                     premise_mask=batch["premise_mask"],
+                    # Conclusion tokens: Oracle's TRUE target (final proof step)
+                    # NOT step k+1 — the actual conclusion of the proof
+                    conclusion_ids=batch["conclusion_ids"],
+                    conclusion_mask=batch["conclusion_mask"],
                 )
 
                 z_predicted = result["z_predicted"]
@@ -254,6 +259,7 @@ def train_jepa(config: DLRConfig) -> dict:
         "model": model,
         "tokenizer": tokenizer,
         "parsed_problems": parsed,
+        "parsed_problems_test": parsed_test,
         "history": history,
     }
 

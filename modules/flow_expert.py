@@ -199,6 +199,10 @@ class FlowExpert(nn.Module):
         """
         Generate a trajectory from noise using ODE integration.
 
+        Hard boundary enforcement:
+          - x[:, 0, :] = z_0 after every integration step
+          - Ensures the trajectory physically starts at the premise
+
         Args:
             z_0: [B, d] premise vector (start boundary)
             z_target: [B, d] goal vector (end boundary)
@@ -213,6 +217,9 @@ class FlowExpert(nn.Module):
 
         # Start from Gaussian noise
         x = torch.randn(B, self.n_waypoints, self.d_model, device=device)
+
+        # Hard boundary: clamp waypoint 0 to premise from the start
+        x[:, 0, :] = z_0
 
         dt = 1.0 / n_steps
         for i in range(n_steps):
@@ -232,6 +239,9 @@ class FlowExpert(nn.Module):
             else:
                 # Standard Euler step
                 x = x + v * dt
+
+            # Hard boundary: trajectory MUST start at premise
+            x[:, 0, :] = z_0
 
         return x
 

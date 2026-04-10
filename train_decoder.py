@@ -63,7 +63,7 @@ def train_decoder(config: DLRConfig, parsed_problems: list = None) -> dict:
     # ── Data ────────────────────────────────────────────────────
     print("\n[2/4] Loading dataset...")
     if parsed_problems is None:
-        raw_dataset = load_dataset_split(config.dataset_name, config.n_samples)
+        raw_dataset, _ = load_dataset_split(config.dataset_name, config.n_samples)
         parsed_problems = parse_all_problems(
             raw_dataset, config.min_steps, config.max_steps
         )

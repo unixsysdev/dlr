@@ -43,7 +43,12 @@ class TransformerEncoder(nn.Module):
     Text encoder for the JEPA.
     Maps token IDs → d-dimensional latent representations.
     Provides both full sequence output (for prompt_kv) and
-    mean-pooled output (for z vectors).
+    attention-pooled output (for z vectors).
+
+    Pooling: Learned attention-weighted pooling replaces mean pooling.
+    A learned query vector attends over all token embeddings, producing
+    a structure-aware representation that distinguishes operand ordering
+    (e.g., '2x = 4' vs '4x = 2').
     """
 
     def __init__(
@@ -71,6 +76,10 @@ class TransformerEncoder(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
         self.norm = nn.LayerNorm(d_model)
+
+        # Learned attention pooling: query vector + projection
+        self.pool_query = nn.Parameter(torch.randn(1, 1, d_model) * 0.02)
+        self.pool_proj = nn.Linear(d_model, 1, bias=False)
 
         # Init weights
         self._init_weights()
@@ -102,11 +111,27 @@ class TransformerEncoder(nn.Module):
         return x
 
     def pool(self, x: torch.Tensor, attention_mask: torch.Tensor = None) -> torch.Tensor:
-        """Mean pool over non-padding tokens → [B, d]."""
+        """
+        Attention-weighted pooling over non-padding tokens → [B, d].
+
+        A learned query vector computes attention scores over the sequence,
+        producing a structure-aware representation. Unlike mean pooling,
+        this preserves operand ordering and syntactic structure.
+        """
+        B, S, d = x.shape
+
+        # Compute attention scores from learned query
+        # pool_query [1, 1, d] broadcasts to [B, S, d]
+        scores = self.pool_proj(x + self.pool_query).squeeze(-1)  # [B, S]
+
+        # Mask out padding positions
         if attention_mask is not None:
-            mask = attention_mask.unsqueeze(-1).float()  # [B, S, 1]
-            return (x * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
-        return x.mean(dim=1)
+            scores = scores.masked_fill(attention_mask == 0, float('-inf'))
+
+        attn_weights = torch.softmax(scores, dim=-1)  # [B, S]
+        pooled = torch.bmm(attn_weights.unsqueeze(1), x).squeeze(1)  # [B, d]
+
+        return pooled
 
 
 class Predictor(nn.Module):
@@ -217,6 +242,8 @@ class TextJEPA(nn.Module):
         target_mask: torch.Tensor,
         premise_ids: torch.Tensor = None,
         premise_mask: torch.Tensor = None,
+        conclusion_ids: torch.Tensor = None,
+        conclusion_mask: torch.Tensor = None,
     ):
         """
         Forward pass for JEPA + Oracle training.
@@ -224,15 +251,17 @@ class TextJEPA(nn.Module):
         Args:
             context_ids: [B, S] context (premise + steps 0..i)
             context_mask: [B, S]
-            target_ids: [B, S] next step (i+1)
+            target_ids: [B, S] next step (i+1) — micro-predictor target
             target_mask: [B, S]
-            premise_ids: [B, S] premise only (for Oracle training)
+            premise_ids: [B, S] premise only — Oracle INPUT
             premise_mask: [B, S]
+            conclusion_ids: [B, S] final step only — Oracle TARGET
+            conclusion_mask: [B, S]
 
         Returns:
             dict with:
-                jepa_loss: L2 prediction loss
-                oracle_loss: Oracle MSE loss (0 if no premise provided)
+                jepa_loss: L2 prediction loss (micro-predictor)
+                oracle_loss: Oracle MSE loss against true conclusion
                 z_var: variance of z_target (collapse detector)
                 z_target: [B, d] target representations (detached)
         """
@@ -254,19 +283,23 @@ class TextJEPA(nn.Module):
         # Collapse detection: per-dim variance averaged across batch
         z_var = z_target.var(dim=0).mean().item()
 
-        # Oracle loss (if premise provided)
+        # Oracle loss: predict CONCLUSION from PREMISE
         oracle_loss = torch.tensor(0.0, device=context_ids.device)
-        if premise_ids is not None:
+        if premise_ids is not None and conclusion_ids is not None:
+            # Encode premise through EMA target encoder
             with torch.no_grad():
                 prem_seq = self.target_encoder(premise_ids, premise_mask)
                 z_0 = self.target_encoder.pool(prem_seq, premise_mask)  # [B, d]
 
-            # Oracle predicts z_final from z_0
+                # Encode the ACTUAL conclusion (final step, NOT step k+1)
+                concl_seq = self.target_encoder(conclusion_ids, conclusion_mask)
+                z_final = self.target_encoder.pool(concl_seq, conclusion_mask)  # [B, d]
+
+            # Oracle predicts z_final from z_0 (premise only)
             z_hat_final = self.oracle(z_0)  # [B, d]
 
-            # z_final = the full-context encoding (last step)
-            # Use z_target as proxy for z_final in the current batch
-            oracle_loss = torch.nn.functional.mse_loss(z_hat_final, z_target.detach())
+            # MSE against the TRUE conclusion, not step k+1
+            oracle_loss = torch.nn.functional.mse_loss(z_hat_final, z_final.detach())
 
         return {
             "jepa_loss": jepa_loss,

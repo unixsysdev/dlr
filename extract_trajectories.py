@@ -86,7 +86,7 @@ def extract_trajectories(
 
     if parsed_problems is None:
         print("[2/3] Loading dataset...")
-        raw_dataset = load_dataset_split(config.dataset_name, config.n_samples)
+        raw_dataset, _ = load_dataset_split(config.dataset_name, config.n_samples)
         parsed_problems = parse_all_problems(
             raw_dataset, config.min_steps, config.max_steps
         )

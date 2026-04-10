@@ -225,7 +225,7 @@ def main():
 
     # ── Load data ───────────────────────────────────────────────
     print(f"\n[1/4] Loading {args.n_samples} problems...")
-    raw = load_dataset_split("AI-MO/NuminaMath-CoT", args.n_samples)
+    raw, _ = load_dataset_split("AI-MO/NuminaMath-CoT", args.n_samples)
     parsed = parse_all_problems(raw, min_steps=2, max_steps=20)
     print(f"  ✓ {len(parsed)} problems parsed")
 

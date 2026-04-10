@@ -17,14 +17,26 @@ from typing import List, Dict, Tuple, Optional
 SPECIAL_TOKENS = ["[PREMISE]", "[/PREMISE]", "[STEP]", "[/STEP]", "[CONCLUSION]"]
 
 
-def load_dataset_split(dataset_name: str, n_samples: int):
-    """Load a subset of NuminaMath-CoT."""
+def load_dataset_split(dataset_name: str, n_samples: int, test_ratio: float = 0.1):
+    """
+    Load NuminaMath-CoT with explicit train/test split.
+
+    Returns:
+        (train_dataset, test_dataset) — disjoint subsets
+    """
     from datasets import load_dataset
 
     ds = load_dataset(dataset_name, split="train")
-    # Shuffle and take n_samples
     ds = ds.shuffle(seed=42).select(range(min(n_samples, len(ds))))
-    return ds
+
+    n_test = max(int(len(ds) * test_ratio), 1)
+    n_train = len(ds) - n_test
+
+    train_ds = ds.select(range(n_train))
+    test_ds = ds.select(range(n_train, n_train + n_test))
+
+    print(f"  Data split: {n_train} train / {n_test} test")
+    return train_ds, test_ds
 
 
 def parse_solution_steps(solution_text: str) -> List[str]:
@@ -93,6 +105,11 @@ def format_target(step: str) -> str:
     return f"[STEP] {step} [/STEP]"
 
 
+def format_conclusion(steps: List[str]) -> str:
+    """Format the FINAL step only — the conclusion. Used as Oracle's true target."""
+    return f"[STEP] {steps[-1]} [/STEP] [CONCLUSION]"
+
+
 def format_full_solution(steps: List[str]) -> str:
     """Format the complete solution for decoder training."""
     parts = [f"[STEP] {s} [/STEP]" for s in steps]
@@ -158,10 +175,11 @@ class JEPADataset(Dataset):
     """
     Dataset for Phase 1: JEPA + Oracle training.
 
-    Yields (context, target, premise) triples using a sliding window:
-      Context = [PREMISE] problem [/PREMISE] [STEP] s1 [/STEP] ... [STEP] si [/STEP]
-      Target  = [STEP] s_{i+1} [/STEP]
-      Premise = [PREMISE] problem [/PREMISE]  (Oracle gets ONLY this)
+    Yields 5-tuples using a sliding window:
+      Context    = [PREMISE] problem [/PREMISE] [STEP] s1 ... [STEP] si
+      Target     = [STEP] s_{i+1} [/STEP]          (micro-predictor target)
+      Premise    = [PREMISE] problem [/PREMISE]     (Oracle input — premise ONLY)
+      Conclusion = [STEP] s_final [/STEP] [CONCLUSION]  (Oracle target — final step)
     """
 
     def __init__(
@@ -179,8 +197,9 @@ class JEPADataset(Dataset):
             problem = item["problem"]
             steps = item["steps"]
             premise = format_premise(problem)
+            conclusion = format_conclusion(steps)
 
-            # Sliding window: each pair is (prefix, next_step, premise)
+            # Sliding window: each pair is (prefix, next_step, premise, conclusion)
             for i in range(len(steps) - 1):
                 context = format_context(problem, steps, i)
                 target = format_target(steps[i + 1])
@@ -193,7 +212,7 @@ class JEPADataset(Dataset):
                     skipped += 1
                     continue
 
-                self.pairs.append((context, target, premise))
+                self.pairs.append((context, target, premise, conclusion))
 
         print(f"  JEPADataset: {len(self.pairs)} context→target pairs"
               f" ({skipped} skipped due to truncation)")
@@ -202,7 +221,7 @@ class JEPADataset(Dataset):
         return len(self.pairs)
 
     def __getitem__(self, idx):
-        context, target, premise = self.pairs[idx]
+        context, target, premise, conclusion = self.pairs[idx]
 
         ctx = self.tokenizer(
             context,
@@ -225,6 +244,13 @@ class JEPADataset(Dataset):
             truncation=True,
             return_tensors="pt",
         )
+        concl = self.tokenizer(
+            conclusion,
+            max_length=self.max_seq_len,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt",
+        )
 
         return {
             "context_ids": ctx["input_ids"].squeeze(0),
@@ -233,6 +259,8 @@ class JEPADataset(Dataset):
             "target_mask": tgt["attention_mask"].squeeze(0),
             "premise_ids": prem["input_ids"].squeeze(0),
             "premise_mask": prem["attention_mask"].squeeze(0),
+            "conclusion_ids": concl["input_ids"].squeeze(0),
+            "conclusion_mask": concl["attention_mask"].squeeze(0),
         }
 
 

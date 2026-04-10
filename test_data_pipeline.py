@@ -42,7 +42,7 @@ def main():
     # ── 1. Load dataset ─────────────────────────────────────────
     print(f"\n[1/5] Loading {args.n_samples} problems from NuminaMath-CoT...")
     try:
-        raw = load_dataset_split("AI-MO/NuminaMath-CoT", args.n_samples)
+        raw, _ = load_dataset_split("AI-MO/NuminaMath-CoT", args.n_samples)
         print(f"  ✓ Loaded {len(raw)} problems")
     except Exception as e:
         print(f"  ✗ Failed to load dataset: {e}")

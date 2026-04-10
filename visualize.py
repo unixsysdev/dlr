@@ -468,40 +468,6 @@ def evaluate_token_recovery(
 
 # ─── Decoder Training Curves ───────────────────────────────────
 
-
-def plot_decoder_training(data_dir: str, plot_dir: str):
-    """Plot decoder loss and perplexity curves."""
-    history_path = os.path.join(data_dir, "decoder_history.json")
-    if not os.path.exists(history_path):
-        print("  ⚠ No decoder history found, skipping")
-        return
-
-    with open(history_path) as f:
-        history = json.load(f)
-
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-    # Loss
-    axes[0].plot(history["loss"], alpha=0.2, color="#00d4ff", linewidth=0.5)
-    window = max(len(history["loss"]) // 50, 1)
-    smoothed = np.convolve(history["loss"], np.ones(window) / window, mode="valid")
-    axes[0].plot(smoothed, color="#00d4ff", linewidth=2)
-    axes[0].set_title("Decoder Cross-Entropy Loss", fontweight="bold")
-    axes[0].set_xlabel("Step")
-    axes[0].set_ylabel("CE Loss")
-
-    # Perplexity
-    axes[1].plot(history["perplexity"], marker="o", color="#ff6b6b",
-                 linewidth=2, markersize=4)
-    axes[1].set_title("Decoder Perplexity", fontweight="bold")
-    axes[1].set_xlabel("Epoch")
-    axes[1].set_ylabel("Perplexity")
-    axes[1].set_yscale("log")
-
-    fig.suptitle("Phase 3: Scribe Decoder Training", fontsize=16, fontweight="bold")
-    plt.tight_layout()
-    plt.savefig(os.path.join(plot_dir, "07_decoder_training.png"), dpi=150, bbox_inches="tight")
-    plt.close()
 # ─── Metric E: Full Pipeline Recovery (Honest End-to-End) ──────
 
 

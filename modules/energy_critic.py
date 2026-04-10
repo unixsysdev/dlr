@@ -4,6 +4,11 @@ Energy Critic — Manifold Guardrail for Trajectories
 Learns an energy function E(z) → scalar that distinguishes
 valid proof states (on-manifold) from invalid states (off-manifold).
 
+Architecture: MLP with spectral normalization for Lipschitz stability.
+Spectral norm constrains the largest singular value of each weight
+matrix to 1, preventing energy values from exploding and ensuring
+smooth energy landscapes.
+
 Training:
   Positive samples (low energy): Real waypoints from Z_true
   Negative samples (high energy): Gaussian-perturbed waypoints
@@ -28,20 +33,18 @@ class EnergyCritic(nn.Module):
     Low energy = valid proof state (on the learned manifold).
     High energy = invalid state (hallucination, logical error).
 
-    Architecture: MLP with spectral normalization for Lipschitz
-    stability (prevents energy values from exploding).
+    Architecture: MLP with spectral normalization on all linear layers
+    for Lipschitz stability (prevents energy explosion).
     """
 
     def __init__(self, d_model: int, hidden_dim: int = 256):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(d_model, hidden_dim),
+            nn.utils.parametrizations.spectral_norm(nn.Linear(d_model, hidden_dim)),
             nn.GELU(),
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, hidden_dim),
+            nn.utils.parametrizations.spectral_norm(nn.Linear(hidden_dim, hidden_dim)),
             nn.GELU(),
-            nn.LayerNorm(hidden_dim),
-            nn.Linear(hidden_dim, 1),  # Scalar energy output
+            nn.utils.parametrizations.spectral_norm(nn.Linear(hidden_dim, 1)),
         )
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
@@ -98,46 +101,34 @@ def flow_energy_penalty(
     t: torch.Tensor,
 ) -> torch.Tensor:
     """
-    Gradient-based energy penalty for the flow loss.
+    Energy penalty that backpropagates into the Flow Expert.
 
-    Instead of projecting to the endpoint (which assumes a straight line
-    and is inconsistent with Heun's method), we compute the energy gradient
-    ∇E(x_t) and penalize velocity vectors that point toward high-energy
-    regions (steepest energy ascent).
+    Evaluates the energy of the current predicted state and allows
+    gradients to flow through v_pred into the Flow Expert's weights.
 
-    This is solver-agnostic: it works at the current timestep regardless
-    of whether the ODE integrator uses Euler, Heun, or higher-order methods.
+    The penalty is simply E(x_t + v_pred * dt) where dt is a small
+    lookahead — the energy at a short extrapolation of the current
+    velocity. Gradients flow through v_pred because we do NOT detach it.
+
+    This replaces the previous gradient-ascent cosine approach which
+    detached v_pred and contributed zero gradients to the Flow Expert.
 
     Args:
-        critic: EnergyCritic module
-        x_t: [B, N, d] current noisy trajectory
-        v_pred: [B, N, d] predicted velocity (detached from critic grad)
-        t: [B] current timestep (unused, kept for API compatibility)
+        critic: EnergyCritic module (weights frozen via optimizer separation)
+        x_t: [B, N, d] current noisy trajectory (detached from flow graph)
+        v_pred: [B, N, d] predicted velocity — MUST have grad enabled
+        t: [B] current timestep
 
     Returns:
-        Scalar energy penalty (higher = velocity points toward invalid regions)
+        Scalar energy penalty with gradients flowing through v_pred
     """
-    # Enable gradient tracking on x_t for autograd
-    x_t_detached = x_t.detach().requires_grad_(True)
+    # Short lookahead: where would the velocity take us in one small step?
+    # Using a small fixed dt (not remaining_time) to avoid Euler assumption
+    dt = 0.05  # Small fixed lookahead step
+    x_ahead = x_t.detach() + v_pred * dt  # [B, N, d] — gradients flow through v_pred
 
-    # Compute energy at current state
-    energy = critic(x_t_detached)  # [B, N]
-    energy_sum = energy.sum()
+    # Energy at the lookahead point — critic weights are frozen by
+    # optimizer separation, but v_pred's graph is preserved
+    energy = critic(x_ahead)  # [B, N]
 
-    # Gradient of energy w.r.t. x_t: direction of steepest energy ascent
-    grad_e = torch.autograd.grad(
-        energy_sum, x_t_detached, create_graph=False
-    )[0]  # [B, N, d]
-
-    # Penalize velocity pointing in the direction of energy ascent
-    # cosine_similarity > 0 means velocity points toward high energy
-    v_flat = v_pred.detach().reshape(-1, v_pred.shape[-1])  # [B*N, d]
-    g_flat = grad_e.reshape(-1, grad_e.shape[-1])            # [B*N, d]
-
-    cos_sim = F.cosine_similarity(v_flat, g_flat, dim=-1)  # [B*N]
-
-    # Only penalize positive alignment (velocity toward high energy)
-    # Negative alignment means velocity points away from high energy (good)
-    penalty = F.relu(cos_sim).mean()
-
-    return penalty
+    return energy.mean()
