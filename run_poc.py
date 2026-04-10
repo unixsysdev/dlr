@@ -139,12 +139,6 @@ def main():
         tokenizer = result["tokenizer"]
         parsed_problems = result["parsed_problems"]
 
-        if result["collapsed"]:
-            print("\n⚠️ JEPA collapsed! Consider:")
-            print("  → Lower jepa_lr (try 1e-4)")
-            print("  → Start ema_start higher (try 0.998)")
-            print("  → Increase predictor_hidden")
-
     # ── PHASE 1.5: Extract Trajectories ─────────────────────────
     if args.skip_to in (None, "extract"):
         from extract_trajectories import extract_trajectories
@@ -156,7 +150,7 @@ def main():
         from train_flow import train_flow
 
         result = train_flow(config)
-        flow_model = result["model"]
+        flow_model = result["flow_model"]
 
     # ── PHASE 3: Train Decoder ──────────────────────────────────
     if args.skip_to in (None, "extract", "flow", "decoder"):
@@ -200,6 +194,25 @@ def main():
             ).to(config.device)
             decoder_model.load_state_dict(ckpt["model_state_dict"])
 
+    if jepa_model is None:
+        jepa_ckpt = os.path.join(config.checkpoint_dir, "jepa_final.pt")
+        if os.path.exists(jepa_ckpt):
+            from modules.text_jepa import TextJEPA
+            from data_pipeline import prepare_tokenizer as _pt
+            if tokenizer is None:
+                tokenizer = _pt()
+            ckpt = torch.load(jepa_ckpt, map_location=config.device, weights_only=False)
+            jepa_model = TextJEPA(
+                vocab_size=ckpt["vocab_size"],
+                d_model=config.d_model,
+                n_heads=config.n_heads,
+                n_layers=config.encoder_layers,
+                predictor_hidden=config.predictor_hidden,
+                oracle_layers=config.oracle_layers,
+                oracle_expansion=config.oracle_expansion,
+            ).to(config.device)
+            jepa_model.load_state_dict(ckpt["model_state_dict"])
+
     if parsed_problems is None:
         from data_pipeline import load_dataset_split, parse_all_problems
         raw = load_dataset_split(config.dataset_name, config.n_samples)
@@ -207,6 +220,7 @@ def main():
 
     generate_full_dashboard(
         config,
+        jepa_model=jepa_model,
         flow_model=flow_model,
         decoder_model=decoder_model,
         parsed_problems=parsed_problems,

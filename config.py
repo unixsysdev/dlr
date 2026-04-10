@@ -55,6 +55,24 @@ class DLRConfig:
     decoder_window_half: int = 2    # Sliding window half-width
     use_gt_trajectories: bool = True  # Use Z_true instead of generated
 
+    # ── VICReg (Anti-Collapse) ─────────────────────────────────────
+    vicreg_lambda_inv: float = 25.0   # Invariance (MSE) weight
+    vicreg_lambda_var: float = 25.0   # Variance (anti-collapse) weight
+    vicreg_lambda_cov: float = 1.0    # Covariance (decorrelation) weight
+    vicreg_gamma: float = 1.0         # Variance hinge threshold (min std)
+
+    # ── Oracle (Goal State Predictor) ─────────────────────────────
+    oracle_layers: int = 4            # Depth of Oracle residual MLP
+    oracle_expansion: int = 4         # FFN expansion factor
+    oracle_loss_weight: float = 1.0   # Weight of Oracle loss in total
+
+    # ── Energy Critic (Manifold Guardrail) ────────────────────────
+    energy_hidden: int = 256          # Critic hidden dim
+    energy_margin: float = 1.0        # Contrastive margin
+    energy_noise_std: float = 0.5     # Std for negative samples
+    energy_penalty_weight: float = 0.1  # α in flow loss
+    energy_lr: float = 1e-4           # Critic learning rate
+
     # ── ODE Solver ──────────────────────────────────────────────────
     ode_steps: int = 50          # Euler integration steps
     ode_solver: str = "heun"     # 'euler' (fast) or 'heun' (accurate)
@@ -153,6 +171,24 @@ def production_config() -> DLRConfig:
         decoder_weight_decay=0.01,
         decoder_max_seq_len=512,
         decoder_window_half=3,
+
+        # VICReg
+        vicreg_lambda_inv=25.0,
+        vicreg_lambda_var=25.0,
+        vicreg_lambda_cov=1.0,
+        vicreg_gamma=1.0,
+
+        # Oracle
+        oracle_layers=6,
+        oracle_expansion=4,
+        oracle_loss_weight=1.0,
+
+        # Energy Critic
+        energy_hidden=512,
+        energy_margin=1.0,
+        energy_noise_std=0.5,
+        energy_penalty_weight=0.1,
+        energy_lr=5e-5,
 
         # ODE
         ode_steps=100,

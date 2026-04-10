@@ -502,6 +502,169 @@ def plot_decoder_training(data_dir: str, plot_dir: str):
     plt.tight_layout()
     plt.savefig(os.path.join(plot_dir, "07_decoder_training.png"), dpi=150, bbox_inches="tight")
     plt.close()
+# ─── Metric E: Full Pipeline Recovery (Honest End-to-End) ──────
+
+
+def evaluate_full_pipeline(
+    jepa_model,
+    flow_model,
+    decoder_model,
+    data_dir: str,
+    plot_dir: str,
+    parsed_problems: list,
+    tokenizer,
+    config,
+    n_samples: int = 10,
+):
+    """
+    Metric E: The honest test. Zero oracle leakage.
+
+    Pipeline:
+        1. Encode premise → z_0
+        2. Oracle predicts ẑ_final from z_0
+        3. Flow Expert generates Z_gen from noise, conditioned on z_0 + ẑ_final
+        4. Decoder translates Z_gen into text
+        5. Compare against ground truth
+    """
+    traj_path = os.path.join(data_dir, "trajectories.pt")
+    data = torch.load(traj_path, weights_only=False)
+    device = config.device
+
+    Z_true = data["Z_true"][:n_samples].to(device)
+    indices = data["problem_indices"][:n_samples]
+
+    jepa_model.eval()
+    flow_model.eval()
+    decoder_model.eval()
+
+    bos_id = tokenizer.cls_token_id
+    eos_id = tokenizer.sep_token_id
+
+    results = []
+    for i in range(min(n_samples, len(Z_true))):
+        # Step 1: z_0 from trajectory (premise)
+        z_0 = Z_true[i, 0:1, :]  # [1, d]
+
+        # Step 2: Oracle predicts goal (NO ground-truth leakage)
+        z_hat_final = jepa_model.predict_goal(z_0)  # [1, d]
+
+        # Step 3: Flow generates trajectory from noise
+        Z_gen = flow_model.generate(
+            z_0, z_hat_final,
+            n_steps=config.ode_steps,
+            solver=config.ode_solver,
+        )  # [1, N, d]
+
+        # Step 4: Decoder translates to text
+        generated_ids = decoder_model.generate(
+            Z_gen,
+            bos_token_id=bos_id,
+            eos_token_id=eos_id,
+            max_length=config.decoder_max_seq_len,
+            temperature=config.eval_temperature,
+        )
+        gen_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+
+        # Step 5: Compare against ground truth
+        prob_idx = indices[i]
+        if prob_idx < len(parsed_problems):
+            gt_steps = parsed_problems[prob_idx]["steps"]
+            gt_text = " ".join(gt_steps)
+        else:
+            gt_text = ""
+
+        gen_tokens = extract_math_tokens(gen_text)
+        gt_tokens = extract_math_tokens(gt_text)
+
+        if gt_tokens:
+            recovered = gen_tokens & gt_tokens
+            recovery_rate = len(recovered) / len(gt_tokens)
+        else:
+            recovered = set()
+            recovery_rate = 0.0
+
+        results.append({
+            "problem_idx": prob_idx,
+            "generated": gen_text[:200],
+            "ground_truth": gt_text[:200],
+            "recovery_rate": recovery_rate,
+            "recovered": list(recovered),
+        })
+
+    # Plot
+    rates = [r["recovery_rate"] for r in results]
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.bar(range(len(rates)), rates, color="#ff6b6b", alpha=0.8)
+    ax.axhline(y=np.mean(rates), color="#ffcc00", linestyle="--",
+               label=f"Mean: {np.mean(rates):.2%}")
+    ax.set_title("Metric E: Full Pipeline Recovery (Oracle→Flow→Decoder)\n"
+                 "HONEST TEST — No ground-truth leakage",
+                 fontweight="bold")
+    ax.set_xlabel("Problem")
+    ax.set_ylabel("Recovery Rate")
+    ax.set_ylim(0, 1.1)
+    ax.legend()
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(plot_dir, "08_full_pipeline_recovery.png"),
+                dpi=150, bbox_inches="tight")
+    plt.close()
+
+    print(f"  ✓ Saved 08_full_pipeline_recovery.png")
+    print(f"    Mean full-pipeline recovery: {np.mean(rates):.2%}")
+
+    # Print samples
+    print("\n  ── Full Pipeline Samples (Honest) ──")
+    for r in results[:5]:
+        print(f"\n    Problem {r['problem_idx']}:")
+        print(f"    GT:  {r['ground_truth'][:120]}...")
+        print(f"    Gen: {r['generated'][:120]}...")
+        print(f"    Recovered: {r['recovered']} ({r['recovery_rate']:.0%})")
+
+    # Save
+    results_path = os.path.join(data_dir, "full_pipeline_results.json")
+    with open(results_path, "w") as f:
+        json.dump(results, f, indent=2)
+
+    return results
+
+
+# ─── Decoder Training Curves ───────────────────────────────────
+
+
+def plot_decoder_training(data_dir: str, plot_dir: str):
+    """Plot decoder loss and perplexity curves."""
+    history_path = os.path.join(data_dir, "decoder_history.json")
+    if not os.path.exists(history_path):
+        print("  ⚠ No decoder history found, skipping")
+        return
+
+    with open(history_path) as f:
+        history = json.load(f)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Loss
+    axes[0].plot(history["loss"], alpha=0.2, color="#00d4ff", linewidth=0.5)
+    window = max(len(history["loss"]) // 50, 1)
+    smoothed = np.convolve(history["loss"], np.ones(window) / window, mode="valid")
+    axes[0].plot(smoothed, color="#00d4ff", linewidth=2)
+    axes[0].set_title("Decoder Cross-Entropy Loss", fontweight="bold")
+    axes[0].set_xlabel("Step")
+    axes[0].set_ylabel("CE Loss")
+
+    # Perplexity
+    axes[1].plot(history["perplexity"], marker="o", color="#ff6b6b",
+                 linewidth=2, markersize=4)
+    axes[1].set_title("Decoder Perplexity", fontweight="bold")
+    axes[1].set_xlabel("Epoch")
+    axes[1].set_ylabel("Perplexity")
+    axes[1].set_yscale("log")
+
+    fig.suptitle("Phase 3: Scribe Decoder Training", fontsize=16, fontweight="bold")
+    plt.tight_layout()
+    plt.savefig(os.path.join(plot_dir, "07_decoder_training.png"), dpi=150, bbox_inches="tight")
+    plt.close()
     print("  ✓ Saved 07_decoder_training.png")
 
     print(f"    Final perplexity: {history['perplexity'][-1]:.1f}")
@@ -512,6 +675,7 @@ def plot_decoder_training(data_dir: str, plot_dir: str):
 
 def generate_full_dashboard(
     config,
+    jepa_model=None,
     flow_model=None,
     decoder_model=None,
     parsed_problems=None,
@@ -525,7 +689,7 @@ def generate_full_dashboard(
     setup_plots(config.plot_dir)
 
     # Phase 1 plots
-    print("\n── Phase 1: JEPA ──")
+    print("\n── Phase 1: JEPA + Oracle ──")
     plot_jepa_training(config.data_dir, config.plot_dir)
 
     # Trajectory analysis
@@ -534,7 +698,7 @@ def generate_full_dashboard(
     visualize_trajectories(config.data_dir, config.plot_dir)
 
     # Phase 2 plots
-    print("\n── Phase 2: Flow Expert ──")
+    print("\n── Phase 2: Flow Expert + Energy Critic ──")
     plot_flow_training(config.data_dir, config.plot_dir)
     if flow_model is not None:
         evaluate_flow_endpoint(flow_model, config.data_dir, config.plot_dir, config)
@@ -542,11 +706,26 @@ def generate_full_dashboard(
     # Phase 3 plots
     print("\n── Phase 3: Decoder ──")
     plot_decoder_training(config.data_dir, config.plot_dir)
+
+    # Metric D: Token recovery on Z_true (diagnostic, not primary)
     if decoder_model is not None and parsed_problems is not None and tokenizer is not None:
+        print("\n── Metric D: Token Recovery (Z_true — diagnostic) ──")
         evaluate_token_recovery(
             decoder_model, config.data_dir, config.plot_dir,
             parsed_problems, tokenizer, config,
         )
 
+    # Metric E: Full pipeline (HONEST — primary pass/fail)
+    if (jepa_model is not None and flow_model is not None
+            and decoder_model is not None and parsed_problems is not None
+            and tokenizer is not None):
+        print("\n── Metric E: Full Pipeline Recovery (HONEST) ──")
+        evaluate_full_pipeline(
+            jepa_model, flow_model, decoder_model,
+            config.data_dir, config.plot_dir,
+            parsed_problems, tokenizer, config,
+        )
+
     print(f"\n  All plots saved to {config.plot_dir}/")
     print("=" * 60)
+

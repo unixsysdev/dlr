@@ -1,12 +1,17 @@
 """
-Phase 1: Train the Text-JEPA
+Phase 1: Train the Text-JEPA + Oracle (VICReg)
 
-Trains the JEPA to predict the next reasoning step's
-latent representation from the current context.
+Trains the JEPA to predict the next reasoning step's latent
+representation, using VICReg loss for structural anti-collapse.
+Simultaneously trains the Oracle to predict z_final from z_0.
+
+Loss:
+  L_total = L_vicreg(z_pred, z_target) + λ_oracle · L_oracle(ẑ_final, z_target)
 
 Monitoring:
-  - Loss curve (should decrease monotonically)
-  - z_var (MUST stay > collapse_threshold, else space collapsed)
+  - VICReg sub-losses: invariance, variance, covariance
+  - Oracle loss (endpoint prediction quality)
+  - z_var (legacy collapse monitor, now backed by VICReg guarantee)
   - EMA tau schedule
 """
 
@@ -19,6 +24,7 @@ from tqdm import tqdm
 
 from config import DLRConfig
 from modules.text_jepa import TextJEPA
+from modules.vicreg import vicreg_loss
 from data_pipeline import (
     load_dataset_split,
     parse_all_problems,
@@ -29,13 +35,13 @@ from data_pipeline import (
 
 def train_jepa(config: DLRConfig) -> dict:
     """
-    Train the Text-JEPA and return training history.
+    Train the Text-JEPA + Oracle and return training history.
 
     Returns:
         dict with model, tokenizer, parsed_problems, and history
     """
     print("=" * 60)
-    print("PHASE 1: Training Text-JEPA")
+    print("PHASE 1: Training Text-JEPA + Oracle (VICReg)")
     print("=" * 60)
 
     # ── Setup ───────────────────────────────────────────────────
@@ -71,7 +77,7 @@ def train_jepa(config: DLRConfig) -> dict:
     )
 
     # Model
-    print("\n[3/4] Building Text-JEPA...")
+    print("\n[3/4] Building Text-JEPA + Oracle...")
     model = TextJEPA(
         vocab_size=vocab_size,
         d_model=config.d_model,
@@ -81,15 +87,19 @@ def train_jepa(config: DLRConfig) -> dict:
         dropout=config.dropout,
         ff_mult=config.ff_mult,
         max_len=config.max_seq_len,
+        oracle_layers=config.oracle_layers,
+        oracle_expansion=config.oracle_expansion,
     ).to(config.device)
 
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.trainable_parameters())
+    oracle_params = sum(p.numel() for p in model.oracle.parameters())
     print(f"  Total params: {total_params:,}")
     print(f"  Trainable params: {trainable_params:,}")
+    print(f"  Oracle params: {oracle_params:,}")
     print(f"  Target encoder params (EMA, frozen): {total_params - trainable_params:,}")
 
-    # Optimizer (only context encoder + predictor)
+    # Optimizer (context encoder + predictor + oracle)
     optimizer = torch.optim.AdamW(
         model.trainable_parameters(),
         lr=config.jepa_lr,
@@ -97,9 +107,6 @@ def train_jepa(config: DLRConfig) -> dict:
     )
 
     # ── Compute: torch.compile ──────────────────────────────────
-    # NOTE: We compile the full model but only optimize context_encoder + predictor.
-    # EMA updates operate on the raw (uncompiled) parameters via model._orig_mod
-    # if compiled, so we keep a reference to the uncompiled model for EMA.
     raw_model = model
     model = config.maybe_compile(model)
 
@@ -109,10 +116,18 @@ def train_jepa(config: DLRConfig) -> dict:
     print(f"\n[4/4] Training for {config.jepa_epochs} epochs "
           f"({total_steps} steps)...")
     print(f"  EMA schedule: {config.ema_start} → {config.ema_end} (cosine)")
+    print(f"  VICReg: λ_inv={config.vicreg_lambda_inv}, "
+          f"λ_var={config.vicreg_lambda_var}, "
+          f"λ_cov={config.vicreg_lambda_cov}, "
+          f"γ={config.vicreg_gamma}")
+    print(f"  Oracle weight: {config.oracle_loss_weight}")
 
-    history = {"loss": [], "z_var": [], "ema_tau": [], "epoch_loss": []}
+    history = {
+        "loss": [], "z_var": [], "ema_tau": [], "epoch_loss": [],
+        "inv_loss": [], "var_loss": [], "cov_loss": [],
+        "oracle_loss": [],
+    }
     global_step = 0
-    collapsed = False
     t_start = time.time()
 
     for epoch in range(config.jepa_epochs):
@@ -128,16 +143,39 @@ def train_jepa(config: DLRConfig) -> dict:
 
             # Forward (BF16 autocast for speed)
             with config.autocast_ctx:
-                loss, z_var, _ = model(
+                result = model(
                     batch["context_ids"],
                     batch["context_mask"],
                     batch["target_ids"],
                     batch["target_mask"],
+                    # Pass context as premise proxy for Oracle training
+                    # (the context includes the premise)
+                    premise_ids=batch["context_ids"],
+                    premise_mask=batch["context_mask"],
                 )
+
+                z_predicted = result["z_predicted"]
+                z_target = result["z_target"]
+
+                # VICReg loss (replaces simple MSE)
+                vic_loss, vic_dict = vicreg_loss(
+                    z_predicted,
+                    z_target,
+                    lambda_inv=config.vicreg_lambda_inv,
+                    lambda_var=config.vicreg_lambda_var,
+                    lambda_cov=config.vicreg_lambda_cov,
+                    gamma=config.vicreg_gamma,
+                )
+
+                # Total loss: VICReg + Oracle
+                oracle_loss = result["oracle_loss"]
+                total_loss = vic_loss + config.oracle_loss_weight * oracle_loss
+
+            z_var = result["z_var"]
 
             # Backward
             optimizer.zero_grad()
-            loss.backward()
+            total_loss.backward()
             torch.nn.utils.clip_grad_norm_(
                 raw_model.trainable_parameters(), config.grad_clip
             )
@@ -147,27 +185,26 @@ def train_jepa(config: DLRConfig) -> dict:
             tau = config.ema_schedule(global_step, total_steps)
             raw_model.ema_update(tau)
 
-            # ── Collapse Detection ──────────────────────────────
-            if z_var < config.collapse_threshold:
-                print(f"\n  ⚠️  COLLAPSE DETECTED at step {global_step}!")
-                print(f"      z_var = {z_var:.8f} < threshold {config.collapse_threshold}")
-                print(f"      EMA tau = {tau:.6f}")
-                collapsed = True
-
             # Logging
-            history["loss"].append(loss.item())
+            history["loss"].append(total_loss.item())
             history["z_var"].append(z_var)
             history["ema_tau"].append(tau)
+            history["inv_loss"].append(vic_dict["inv"])
+            history["var_loss"].append(vic_dict["var"])
+            history["cov_loss"].append(vic_dict["cov"])
+            history["oracle_loss"].append(oracle_loss.item())
 
-            epoch_loss += loss.item()
+            epoch_loss += total_loss.item()
             epoch_z_var += z_var
             n_batches += 1
             global_step += 1
 
             pbar.set_postfix(
-                loss=f"{loss.item():.4f}",
-                z_var=f"{z_var:.4f}",
-                tau=f"{tau:.4f}",
+                loss=f"{total_loss.item():.4f}",
+                inv=f"{vic_dict['inv']:.4f}",
+                var=f"{vic_dict['var']:.3f}",
+                ora=f"{oracle_loss.item():.4f}",
+                z_v=f"{z_var:.4f}",
             )
 
         avg_loss = epoch_loss / max(n_batches, 1)
@@ -192,11 +229,13 @@ def train_jepa(config: DLRConfig) -> dict:
                 "n_heads": config.n_heads,
                 "encoder_layers": config.encoder_layers,
                 "predictor_hidden": config.predictor_hidden,
+                "oracle_layers": config.oracle_layers,
+                "oracle_expansion": config.oracle_expansion,
             },
         },
         checkpoint_path,
     )
-    print(f"\n  ✓ JEPA saved to {checkpoint_path}")
+    print(f"\n  ✓ JEPA + Oracle saved to {checkpoint_path}")
 
     # Save tokenizer
     tokenizer_path = os.path.join(config.checkpoint_dir, "tokenizer")
@@ -210,16 +249,12 @@ def train_jepa(config: DLRConfig) -> dict:
 
     total_time = time.time() - t_start
     print(f"\n  Phase 1 complete in {total_time/60:.1f} minutes")
-    if collapsed:
-        print("  ⚠️  WARNING: Collapse was detected during training!")
-        print("  → Consider adjusting EMA schedule or learning rate")
 
     return {
         "model": model,
         "tokenizer": tokenizer,
         "parsed_problems": parsed,
         "history": history,
-        "collapsed": collapsed,
     }
 
 

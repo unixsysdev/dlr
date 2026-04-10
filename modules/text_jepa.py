@@ -15,6 +15,8 @@ import math
 import torch
 import torch.nn as nn
 
+from modules.oracle import Oracle
+
 
 class PositionalEncoding(nn.Module):
     """Sinusoidal positional encoding."""
@@ -137,8 +139,8 @@ class TextJEPA(nn.Module):
     Full Text-JEPA module.
 
     Training:
-        loss, z_var, z_target = jepa(ctx_ids, ctx_mask, tgt_ids, tgt_mask)
-        loss.backward()  # Gradients flow to context_encoder + predictor only
+        loss_dict = jepa(ctx_ids, ctx_mask, tgt_ids, tgt_mask, premise_ids, premise_mask)
+        loss_dict['total_loss'].backward()
         optimizer.step()
         jepa.ema_update(tau)  # Update target_encoder
 
@@ -146,6 +148,10 @@ class TextJEPA(nn.Module):
         z, seq = jepa.encode(input_ids, attention_mask)
         # z: [B, d] mean-pooled vector (for trajectory)
         # seq: [B, S, d] full sequence (for prompt_kv)
+
+    Inference:
+        z_hat_final = jepa.predict_goal(z_0)
+        # Use z_hat_final as the goal for the Flow Expert
     """
 
     def __init__(
@@ -158,6 +164,8 @@ class TextJEPA(nn.Module):
         dropout: float = 0.1,
         ff_mult: int = 4,
         max_len: int = 512,
+        oracle_layers: int = 4,
+        oracle_expansion: int = 4,
     ):
         super().__init__()
         self.d_model = d_model
@@ -177,8 +185,15 @@ class TextJEPA(nn.Module):
         for p in self.target_encoder.parameters():
             p.requires_grad = False
 
-        # Predictor (trainable)
+        # Predictor (trainable) — micro: predicts next step
         self.predictor = Predictor(d_model, predictor_hidden)
+
+        # Oracle (trainable) — macro: predicts final proof state from premise
+        self.oracle = Oracle(
+            d_model=d_model,
+            n_layers=oracle_layers,
+            expansion=oracle_expansion,
+        )
 
     @torch.no_grad()
     def ema_update(self, tau: float):
@@ -200,14 +215,26 @@ class TextJEPA(nn.Module):
         context_mask: torch.Tensor,
         target_ids: torch.Tensor,
         target_mask: torch.Tensor,
+        premise_ids: torch.Tensor = None,
+        premise_mask: torch.Tensor = None,
     ):
         """
-        Forward pass for JEPA training.
+        Forward pass for JEPA + Oracle training.
+
+        Args:
+            context_ids: [B, S] context (premise + steps 0..i)
+            context_mask: [B, S]
+            target_ids: [B, S] next step (i+1)
+            target_mask: [B, S]
+            premise_ids: [B, S] premise only (for Oracle training)
+            premise_mask: [B, S]
 
         Returns:
-            loss: L2 prediction loss
-            z_var: variance of z_target (collapse detector)
-            z_target: [B, d] target representations (detached)
+            dict with:
+                jepa_loss: L2 prediction loss
+                oracle_loss: Oracle MSE loss (0 if no premise provided)
+                z_var: variance of z_target (collapse detector)
+                z_target: [B, d] target representations (detached)
         """
         # Context path (with gradients)
         ctx_seq = self.context_encoder(context_ids, context_mask)
@@ -218,16 +245,36 @@ class TextJEPA(nn.Module):
             tgt_seq = self.target_encoder(target_ids, target_mask)
             z_target = self.target_encoder.pool(tgt_seq, target_mask)  # [B, d]
 
-        # Predict target from context
+        # Predict target from context (micro predictor)
         z_predicted = self.predictor(z_context)  # [B, d]
 
-        # L2 loss against stop-gradient target
-        loss = torch.nn.functional.mse_loss(z_predicted, z_target)
+        # JEPA L2 loss (invariance component — will be wrapped in VICReg)
+        jepa_loss = torch.nn.functional.mse_loss(z_predicted, z_target)
 
         # Collapse detection: per-dim variance averaged across batch
         z_var = z_target.var(dim=0).mean().item()
 
-        return loss, z_var, z_target.detach()
+        # Oracle loss (if premise provided)
+        oracle_loss = torch.tensor(0.0, device=context_ids.device)
+        if premise_ids is not None:
+            with torch.no_grad():
+                prem_seq = self.target_encoder(premise_ids, premise_mask)
+                z_0 = self.target_encoder.pool(prem_seq, premise_mask)  # [B, d]
+
+            # Oracle predicts z_final from z_0
+            z_hat_final = self.oracle(z_0)  # [B, d]
+
+            # z_final = the full-context encoding (last step)
+            # Use z_target as proxy for z_final in the current batch
+            oracle_loss = torch.nn.functional.mse_loss(z_hat_final, z_target.detach())
+
+        return {
+            "jepa_loss": jepa_loss,
+            "oracle_loss": oracle_loss,
+            "z_var": z_var,
+            "z_target": z_target.detach(),
+            "z_predicted": z_predicted,
+        }
 
     @torch.no_grad()
     def encode(self, input_ids: torch.Tensor, attention_mask: torch.Tensor = None):
@@ -242,8 +289,24 @@ class TextJEPA(nn.Module):
         z = self.target_encoder.pool(seq, attention_mask)
         return z, seq
 
+    @torch.no_grad()
+    def predict_goal(self, z_0: torch.Tensor) -> torch.Tensor:
+        """
+        Predict the final proof state from the premise.
+        Used at inference when no ground-truth z_target is available.
+
+        Args:
+            z_0: [B, d] premise vector
+
+        Returns:
+            z_hat_final: [B, d] predicted goal state
+        """
+        return self.oracle(z_0)
+
     def trainable_parameters(self):
         """Returns only the parameters that should be optimized."""
-        return list(self.context_encoder.parameters()) + list(
-            self.predictor.parameters()
+        return (
+            list(self.context_encoder.parameters())
+            + list(self.predictor.parameters())
+            + list(self.oracle.parameters())
         )

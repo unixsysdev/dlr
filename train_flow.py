@@ -1,16 +1,21 @@
 """
-Phase 2: Train the Flow Expert (Rectified Flow)
+Phase 2: Train the Flow Expert + Energy Critic
 
 Trains the DiT-based Flow Expert to generate continuous
-reasoning trajectories from noise → Z_true.
+reasoning trajectories from noise → Z_true, with an Energy
+Critic that penalizes off-manifold trajectories.
 
-The JEPA is frozen. GPUs never run the JEPA during this phase
-because trajectories are pre-extracted.
+V4 Architecture:
+  - Flow Expert uses ẑ_final from Oracle (NOT ground-truth z_target)
+    during evaluation, but ground-truth during training for stability.
+  - Energy Critic trains on contrastive pairs: real waypoints (low energy)
+    vs. perturbed waypoints (high energy).
+  - Energy penalty added to flow loss: α · E(predicted_endpoint)
 
 Rectified Flow:
   x_t = t · Z_true + (1-t) · ε,  ε ~ N(0,I)
   v_true = Z_true - ε
-  L_flow = ||v_θ(x_t, t, z_target) - v_true||² (masked for active waypoints)
+  L_flow = ||v_θ(x_t, t, z_0, z_target) - v_true||² + α · E(endpoint)
 """
 
 import os
@@ -22,18 +27,19 @@ from tqdm import tqdm
 
 from config import DLRConfig
 from modules.flow_expert import FlowExpert, masked_mse_loss
+from modules.energy_critic import EnergyCritic, energy_contrastive_loss, flow_energy_penalty
 from data_pipeline import TrajectoryDataset
 
 
 def train_flow(config: DLRConfig) -> dict:
     """
-    Train the Flow Expert and return training history.
+    Train the Flow Expert + Energy Critic and return training history.
 
     Returns:
-        dict with model and history
+        dict with flow model, energy critic, and history
     """
     print("=" * 60)
-    print("PHASE 2: Training Flow Expert (Rectified Flow)")
+    print("PHASE 2: Training Flow Expert + Energy Critic")
     print("=" * 60)
 
     torch.manual_seed(config.seed)
@@ -54,9 +60,10 @@ def train_flow(config: DLRConfig) -> dict:
         drop_last=False,
     )
 
-    # ── Model ───────────────────────────────────────────────────
-    print("\n[2/3] Building Flow Expert (DiT)...")
-    model = FlowExpert(
+    # ── Models ──────────────────────────────────────────────────
+    print("\n[2/3] Building Flow Expert + Energy Critic...")
+
+    flow_model = FlowExpert(
         d_model=config.d_model,
         n_heads=config.n_heads,
         n_layers=config.flow_layers,
@@ -65,26 +72,48 @@ def train_flow(config: DLRConfig) -> dict:
         dropout=config.dropout,
     ).to(device)
 
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"  Total params: {total_params:,}")
+    energy_critic = EnergyCritic(
+        d_model=config.d_model,
+        hidden_dim=config.energy_hidden,
+    ).to(device)
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
+    flow_params = sum(p.numel() for p in flow_model.parameters())
+    critic_params = sum(p.numel() for p in energy_critic.parameters())
+    print(f"  Flow Expert params: {flow_params:,}")
+    print(f"  Energy Critic params: {critic_params:,}")
+
+    # Separate optimizers (alternating updates)
+    flow_optimizer = torch.optim.AdamW(
+        flow_model.parameters(),
         lr=config.flow_lr,
         weight_decay=config.flow_weight_decay,
     )
+    critic_optimizer = torch.optim.AdamW(
+        energy_critic.parameters(),
+        lr=config.energy_lr,
+    )
 
     # ── Compute: torch.compile ──────────────────────────────────
-    raw_model = model
-    model = config.maybe_compile(model)
+    raw_flow = flow_model
+    raw_critic = energy_critic
+    flow_model = config.maybe_compile(flow_model)
+    # Don't compile the critic — it's small and alternates training
 
     # ── Training Loop ───────────────────────────────────────────
     print(f"\n[3/3] Training for {config.flow_epochs} epochs...")
-    history = {"loss": [], "epoch_loss": []}
+    print(f"  Energy penalty weight α = {config.energy_penalty_weight}")
+    print(f"  Noise std for negatives: {config.energy_noise_std}")
+
+    history = {
+        "loss": [], "epoch_loss": [],
+        "flow_loss": [], "energy_penalty": [],
+        "critic_loss": [],
+    }
     t_start = time.time()
 
     for epoch in range(config.flow_epochs):
-        model.train()
+        flow_model.train()
+        energy_critic.train()
         epoch_loss = 0.0
         n_batches = 0
 
@@ -103,7 +132,22 @@ def train_flow(config: DLRConfig) -> dict:
 
             B = Z_true.shape[0]
 
-            # ── Rectified Flow ──────────────────────────────────
+            # ══════════════════════════════════════════════════
+            # Step 1: Update Energy Critic (contrastive pairs)
+            # ══════════════════════════════════════════════════
+            critic_loss = energy_contrastive_loss(
+                energy_critic, Z_true,
+                noise_std=config.energy_noise_std,
+                margin=config.energy_margin,
+            )
+            critic_optimizer.zero_grad()
+            critic_loss.backward()
+            critic_optimizer.step()
+
+            # ══════════════════════════════════════════════════
+            # Step 2: Update Flow Expert (velocity + energy penalty)
+            # ══════════════════════════════════════════════════
+
             # Sample timestep
             t = torch.rand(B, device=device)  # [B] ~ U(0,1)
 
@@ -119,22 +163,37 @@ def train_flow(config: DLRConfig) -> dict:
 
             # Forward (BF16 autocast)
             with config.autocast_ctx:
-                # Predict velocity (V3: z_0 + z_target via AdaLN, no cross-attention)
-                v_pred = model(x_t, t, z_0, z_target)  # [B, N, d]
+                v_pred = flow_model(x_t, t, z_0, z_target)  # [B, N, d]
 
                 # Masked MSE loss (Velocity Zero-Out)
-                loss = masked_mse_loss(v_pred, v_true, active_mask)
+                flow_mse = masked_mse_loss(v_pred, v_true, active_mask)
+
+                # Energy penalty: penalize high-energy predicted endpoints
+                e_penalty = flow_energy_penalty(
+                    raw_critic, x_t, v_pred, t
+                )
+
+                loss = flow_mse + config.energy_penalty_weight * e_penalty
 
             # Backward
-            optimizer.zero_grad()
+            flow_optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(raw_model.parameters(), config.grad_clip)
-            optimizer.step()
+            torch.nn.utils.clip_grad_norm_(raw_flow.parameters(), config.grad_clip)
+            flow_optimizer.step()
 
+            # Logging
             history["loss"].append(loss.item())
+            history["flow_loss"].append(flow_mse.item())
+            history["energy_penalty"].append(e_penalty.item())
+            history["critic_loss"].append(critic_loss.item())
             epoch_loss += loss.item()
             n_batches += 1
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+            pbar.set_postfix(
+                flow=f"{flow_mse.item():.4f}",
+                e_pen=f"{e_penalty.item():.3f}",
+                crit=f"{critic_loss.item():.3f}",
+            )
 
         avg_loss = epoch_loss / max(n_batches, 1)
         history["epoch_loss"].append(avg_loss)
@@ -146,11 +205,11 @@ def train_flow(config: DLRConfig) -> dict:
                 f"Loss: {avg_loss:.4f} | Time: {elapsed:.0f}s"
             )
 
-    # Save (raw uncompiled model)
-    checkpoint_path = os.path.join(config.checkpoint_dir, "flow_final.pt")
+    # Save (raw uncompiled models)
+    flow_path = os.path.join(config.checkpoint_dir, "flow_final.pt")
     torch.save(
         {
-            "model_state_dict": raw_model.state_dict(),
+            "model_state_dict": raw_flow.state_dict(),
             "config": {
                 "d_model": config.d_model,
                 "n_heads": config.n_heads,
@@ -158,9 +217,16 @@ def train_flow(config: DLRConfig) -> dict:
                 "n_waypoints": config.n_waypoints,
             },
         },
-        checkpoint_path,
+        flow_path,
     )
-    print(f"\n  ✓ Flow Expert saved to {checkpoint_path}")
+    print(f"\n  ✓ Flow Expert saved to {flow_path}")
+
+    critic_path = os.path.join(config.checkpoint_dir, "energy_critic_final.pt")
+    torch.save(
+        {"model_state_dict": raw_critic.state_dict()},
+        critic_path,
+    )
+    print(f"  ✓ Energy Critic saved to {critic_path}")
 
     # Save history
     history_path = os.path.join(config.data_dir, "flow_history.json")
@@ -170,7 +236,11 @@ def train_flow(config: DLRConfig) -> dict:
     total_time = time.time() - t_start
     print(f"  Phase 2 complete in {total_time/60:.1f} minutes")
 
-    return {"model": model, "history": history}
+    return {
+        "flow_model": flow_model,
+        "energy_critic": energy_critic,
+        "history": history,
+    }
 
 
 if __name__ == "__main__":
